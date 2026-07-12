@@ -26,7 +26,10 @@ import {
 
 const router = Router();
 
-const WEBAPP_URL = process.env.WEBAPP_URL ?? "http://localhost:3000";
+// Stripe checkout success/cancel redirects land back in the web app. Default to
+// production (app.betterpomo.com) so a missing env var never redirects a real
+// customer to localhost; override with WEBAPP_URL=http://localhost:3000 in dev.
+const WEBAPP_URL = process.env.WEBAPP_URL ?? "https://app.betterpomo.com";
 const TRIAL_DAYS = 7;
 
 interface BillingRow {
