@@ -101,10 +101,17 @@ completeness" rejection):
 
 ## Permissions sanity ▢
 
-The app uses **local notifications** (timer alerts) and **audio playback**
-(ambient sounds) — neither needs an iOS usage-description string, and none are
-declared, which is correct. Do **not** add camera/microphone/photo permission
-strings: declaring permissions the app doesn't use is a common rejection reason.
+The app uses local timer notifications and APNs-backed Expo push notifications.
+Before building for TestFlight:
+
+- EAS is linked to `@luciano655/betterpomo`; keep project ID `3acf0f8d-eb85-41bf-bc1f-3aa5ba897935` in `app.json`.
+- In Apple Developer → Identifiers → `com.betterpomo.app`, enable **Push Notifications**.
+- Run `eas credentials --platform ios`, configure a new Apple Push Notifications key, and regenerate the provisioning profile.
+- Enable push access-token security in Expo and set `EXPO_ACCESS_TOKEN` on the production API only.
+- Apply `betterpomo-webapp/supabase/migration_push_notifications.sql` before deploying the push-enabled API.
+
+Notification permission does not need an iOS usage-description string. Do not
+add camera or microphone permissions unless those features are actually added.
 
 ## Pre-submit smoke test ▢
 

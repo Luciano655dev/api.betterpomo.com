@@ -5,9 +5,9 @@
 // Multi-instance safe: the UPDATE … RETURNING claims rows by flipping
 // trial_reminder_sent first, so two instances can never send twice.
 import { adminDb } from "./supabase";
-import { cache } from "./cache";
 import { sendEmail } from "./email";
 import { BILLING_ENABLED } from "./plans";
+import { notifySystem } from "./notify";
 
 const SWEEP_INTERVAL_MS = 60 * 60_000; // hourly
 const REMINDER_WINDOW_MS = 48 * 60 * 60_000; // notify when ≤ 2 days remain
@@ -60,17 +60,10 @@ async function sweep(): Promise<void> {
   }
 
   for (const row of (data ?? []) as { id: string; username: string; trial_ends_at: string }[]) {
-    // In-app notification. Inserted directly (not via notify()) because the
-    // "actor" is the user themself and notify() skips self-notifications.
-    await adminDb.from("notifications").insert({
-      user_id: row.id,
-      actor_id: row.id,
+    await notifySystem(row.id, {
       type: "trial_ending",
-      entity_id: null,
+      entityId: null,
       metadata: { trial_ends_at: row.trial_ends_at },
-    }).then(({ error: nErr }) => {
-      if (nErr) console.error("trial_ending notification failed:", nErr.message);
-      else cache.del(`notif:${row.id}`);
     });
 
     const { data: authUser } = await adminDb.auth.admin.getUserById(row.id);

@@ -7,6 +7,7 @@ import { cache, TTL, CHAT_TTL_SECONDS } from "../lib/cache";
 import { notify } from "../lib/notify";
 import { clampInt } from "../lib/utils";
 import { getUserEntitlements, upgradeRequired } from "../lib/plans";
+import { queuePush } from "../lib/push";
 
 const router = Router();
 router.use(authenticate);
@@ -29,6 +30,43 @@ async function resolveUserId(supabase: SupabaseClient, username: string) {
 async function actorSnapshot(supabase: SupabaseClient, userId: string) {
   const { data } = await supabase.from("profiles").select("username, emoji").eq("id", userId).single();
   return { username: data?.username ?? "Someone", emoji: data?.emoji ?? "🍅" };
+}
+
+/** Message alerts are push-only; unread state remains owned by Conversations. */
+async function pushNewMessage(
+  supabase: SupabaseClient,
+  conversationId: string,
+  messageId: string,
+  senderId: string,
+): Promise<void> {
+  try {
+    const [{ data: members, error: membersError }, { data: conversation }, actor] = await Promise.all([
+      supabase.from("conversation_members").select("user_id").eq("conversation_id", conversationId),
+      supabase.from("conversations").select("is_group, title").eq("id", conversationId).single(),
+      actorSnapshot(supabase, senderId),
+    ]);
+    if (membersError) throw membersError;
+    const recipients = (members ?? []).map((member) => member.user_id).filter((id) => id !== senderId);
+    const groupTitle = conversation?.title?.trim() || "your group";
+    await Promise.all(recipients.map((recipientId) => queuePush(
+      recipientId,
+      "messages",
+      `chat_message:${messageId}`,
+      {
+        title: actor.username,
+        body: conversation?.is_group ? `New message in ${groupTitle}` : "Sent you a message",
+        data: {
+          type: "chat_message",
+          conversation_id: conversationId,
+          sender_id: senderId,
+          username: actor.username,
+        },
+        collapseId: `chat:${conversationId}`,
+      },
+    )));
+  } catch (err) {
+    console.error("chat push failed:", err);
+  }
 }
 
 /** Invalidate the conversation-list cache for every member of a conversation. */
@@ -91,21 +129,30 @@ router.post("/conversations/group", async (req, res) => {
     if (!id) { res.status(404).json({ error: `User not found: ${uname}` }); return; }
     ids.push(id);
   }
+  const memberIds = [...new Set(ids)];
 
   // Group size is gated on the creator's plan (members + the creator).
   const ent = await getUserEntitlements(user.id);
-  if (ids.length + 1 > ent.maxGroupMembers) { upgradeRequired(res, "group_chat_size"); return; }
+  if (memberIds.length + 1 > ent.maxGroupMembers) { upgradeRequired(res, "group_chat_size"); return; }
 
   const { data, error } = await supabase.rpc("create_group_conversation", {
     p_actor: user.id,
     p_title: typeof body.title === "string" ? body.title : null,
-    p_member_ids: ids,
+    p_member_ids: memberIds,
   });
   if (error) { res.status(400).json({ error: error.message }); return; }
 
   cache.del(`conversations:${user.id}`);
-  for (const id of ids) cache.del(`conversations:${id}`);
-  res.status(201).json({ data: { id: data as string } });
+  for (const id of memberIds) cache.del(`conversations:${id}`);
+  const conversationId = data as string;
+  const actor = await actorSnapshot(supabase, user.id);
+  await Promise.all(memberIds.map((memberId) => notify(memberId, {
+    actorId: user.id,
+    type: "group_add",
+    entityId: conversationId,
+    metadata: { ...actor, title: typeof body.title === "string" ? body.title.trim() || null : null },
+  })));
+  res.status(201).json({ data: { id: conversationId } });
 });
 
 /** POST /api/chat/conversations/:id/members — add a friend to a group. Body: { username } */
@@ -205,6 +252,7 @@ router.post<{ id: string }>("/conversations/:id/messages", dmMessageLimiter, asy
   if (error) { res.status(400).json({ error: error.message }); return; }
 
   await invalidateConversation(supabase, id);
+  if (data?.id) await pushNewMessage(supabase, id, String(data.id), user.id);
   res.status(201).json({ data });
 });
 

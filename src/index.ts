@@ -20,6 +20,7 @@ import { startEmailScheduler } from "./lib/emailScheduler";
 import { startTrialReminderSweep } from "./lib/trialReminders";
 import { redis } from "./lib/redis";
 import { makeRedisStore } from "./lib/rateStore";
+import { startPushWorker } from "./lib/push";
 
 // Fail fast on boot if required secrets are missing, instead of throwing cryptic
 // errors on the first DB call.
@@ -144,6 +145,7 @@ const server = app.listen(PORT, () => {
   console.log(`BetterPomo API running on http://localhost:${PORT}`);
   startEmailScheduler();
   startTrialReminderSweep();
+  startPushWorker();
 });
 
 // Graceful shutdown so in-flight requests finish on deploy/restart.
