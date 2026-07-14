@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { adminDb, createAnonClient } from "../lib/supabase";
 import { serverError } from "../lib/http";
+import { escapeLike } from "../lib/utils";
 
 const router = Router();
 
@@ -55,7 +56,8 @@ router.post("/register", async (req, res) => {
   const { data: taken, error: lookupError } = await adminDb
     .from("profiles")
     .select("id")
-    .eq("username", username)
+    .ilike("username", escapeLike(username))
+    .limit(1)
     .maybeSingle();
   if (lookupError) { serverError(res, lookupError); return; }
   if (taken) { res.status(400).json({ error: "That username is already taken" }); return; }

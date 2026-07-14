@@ -26,6 +26,23 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // Same rule the registration route enforces — usernames appear in URLs and @mentions.
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
 
+function usernameBase(user: { id: string; email?: string; user_metadata?: Record<string, unknown> }): string {
+  const meta = user.user_metadata ?? {};
+  const source = [meta.username, meta.full_name, meta.name, user.email?.split("@")[0]]
+    .find((value) => typeof value === "string" && value.trim()) as string | undefined;
+  const sanitized = (source ?? "user").toLowerCase().replace(/[^a-z0-9_]/g, "").slice(0, 20);
+  return sanitized.length >= 3 ? sanitized : `user_${user.id.replace(/-/g, "").slice(0, 8)}`;
+}
+
+function usernameCandidate(base: string, attempt: number, userId: string): string {
+  if (attempt === 0) return base;
+  if (attempt <= 50) {
+    const suffix = String(attempt);
+    return `${base.slice(0, 24 - suffix.length)}${suffix}`;
+  }
+  return `user_${userId.replace(/-/g, "").slice(0, 12)}`;
+}
+
 /** Confirms `password` is the account's current password by attempting a sign-in
  *  with a throwaway anon client. Returns true on success. The session it creates
  *  is never persisted (persistSession: false). */
@@ -61,25 +78,37 @@ router.get("/", authenticate, async (req, res) => {
   // didn't fire (some OAuth flows) — would otherwise 500 here forever, leaving
   // the user stuck in an app shell with no profile. Mirror the trigger's logic.
   if (!data) {
-    const meta = (user.user_metadata ?? {}) as Record<string, unknown>;
-    const fromMeta = (k: string) =>
-      typeof meta[k] === "string" && (meta[k] as string).trim() ? (meta[k] as string).trim() : null;
-    const username =
-      fromMeta("username") ??
-      fromMeta("full_name") ??
-      fromMeta("name") ??
-      (user.email ? user.email.split("@")[0] : null) ??
-      `user_${user.id.slice(0, 8)}`;
+    const base = usernameBase(user);
+    for (let attempt = 0; attempt <= 51; attempt += 1) {
+      const result = await supabase
+        .from("profiles")
+        .insert({ id: user.id, username: usernameCandidate(base, attempt, user.id), emoji: "🍅" })
+        .select(PROFILE_COLUMNS)
+        .single();
+      if (!result.error) {
+        const enrichedCreated = withEntitlements(result.data as Partial<PlanRow>);
+        cache.set(cacheKey, enrichedCreated, TTL.PROFILE);
+        res.json({ data: enrichedCreated });
+        return;
+      }
+      if (result.error.code !== "23505") { serverError(res, result.error); return; }
 
-    const { data: created, error: createError } = await supabase
-      .from("profiles")
-      .insert({ id: user.id, username, emoji: "🍅" })
-      .select(PROFILE_COLUMNS)
-      .single();
-    if (createError) { serverError(res, createError); return; }
-    const enrichedCreated = withEntitlements(created as Partial<PlanRow>);
-    cache.set(cacheKey, enrichedCreated, TTL.PROFILE);
-    res.json({ data: enrichedCreated });
+      // A concurrent request may have inserted this user's row first. Return it
+      // instead of continuing to generate usernames for an existing profile.
+      const concurrent = await supabase
+        .from("profiles")
+        .select(PROFILE_COLUMNS)
+        .eq("id", user.id)
+        .maybeSingle();
+      if (concurrent.error) { serverError(res, concurrent.error); return; }
+      if (concurrent.data) {
+        const enrichedCreated = withEntitlements(concurrent.data as Partial<PlanRow>);
+        cache.set(cacheKey, enrichedCreated, TTL.PROFILE);
+        res.json({ data: enrichedCreated });
+        return;
+      }
+    }
+    serverError(res, new Error("Could not allocate a unique username"));
     return;
   }
 
@@ -123,6 +152,10 @@ router.patch("/", authenticate, async (req, res) => {
     .select(PROFILE_COLUMNS)
     .single();
 
+  if (error?.code === "23505") {
+    res.status(409).json({ error: "That username is already taken" });
+    return;
+  }
   if (error) { serverError(res, error); return; }
 
   // Invalidate own profile, all public user lookups, and search results. A

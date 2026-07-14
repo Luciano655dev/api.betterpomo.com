@@ -1,4 +1,5 @@
 import { Router } from "express";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { authenticate } from "../middleware/auth";
 import { serverError } from "../lib/http";
 import { cache, TTL } from "../lib/cache";
@@ -13,6 +14,37 @@ router.use(authenticate);
 // account can't dump an unbounded result set. A generous ceiling covers any real
 // user (years of daily sessions) while capping the worst case.
 const PUBLIC_HISTORY_MAX = 1000;
+
+/** Resolve a public username without ever sending an authenticated user to
+ * another profile that happens to have the same legacy username. New database
+ * constraints prevent duplicates, but this owner-first lookup also repairs the
+ * experience for accounts created before that migration is applied. */
+async function resolveProfileByUsername(
+  supabase: SupabaseClient,
+  username: string,
+  viewerId: string,
+  columns: string,
+) {
+  const own = await supabase
+    .from("profiles")
+    .select(columns)
+    .eq("username", username)
+    .eq("id", viewerId)
+    .maybeSingle();
+  if (own.error) return { profile: null, error: own.error };
+  if (own.data) return { profile: own.data as unknown as Record<string, unknown>, error: null };
+
+  const fallback = await supabase
+    .from("profiles")
+    .select(columns)
+    .eq("username", username)
+    .order("created_at", { ascending: true })
+    .limit(1);
+  return {
+    profile: (fallback.data?.[0] as unknown as Record<string, unknown> | undefined) ?? null,
+    error: fallback.error,
+  };
+}
 
 // GET /api/users/search?q=&page=1&limit=18
 router.get("/search", async (req, res) => {
@@ -48,25 +80,28 @@ router.get("/search", async (req, res) => {
 router.get("/:username", async (req, res) => {
   const username = String(req.params.username);
 
-  const cacheKey = `user:${username}`;
-  const hit = cache.get(cacheKey);
-  if (hit) { res.json({ data: hit }); return; }
-
   // Typed as plain string so supabase-js doesn't literal-parse the union.
   const publicColumns: string = BILLING_ENABLED
     ? "id, username, emoji, bio, is_private, plan, plan_status, plan_period_end"
     : "id, username, emoji, bio, is_private";
-  const { data, error } = await req.supabase
-    .from("profiles")
-    .select(publicColumns)
-    .eq("username", username)
-    .limit(1);
+  const { profile, error } = await resolveProfileByUsername(
+    req.supabase,
+    username,
+    req.user.id,
+    publicColumns,
+  );
 
   if (error) { serverError(res, error); return; }
-  if (!data?.length) { res.status(404).json({ error: "User not found" }); return; }
+  if (!profile) { res.status(404).json({ error: "User not found" }); return; }
+
+  // Cache by immutable profile id, not by a potentially duplicated legacy
+  // username. Otherwise one viewer could prime another account's response.
+  const cacheKey = `user:${String(profile.id)}`;
+  const hit = cache.get(cacheKey);
+  if (hit) { res.json({ data: hit }); return; }
 
   // Expose a computed badge, never raw billing columns.
-  const row = data[0] as unknown as Record<string, unknown>;
+  const row = profile;
   const { plan: _p, plan_status: _ps, plan_period_end: _pe, ...publicProfile } = row;
   void _p; void _ps; void _pe;
   const payload = { ...publicProfile, badge: getEntitlements(row as Partial<PlanRow>).badge };
@@ -79,13 +114,14 @@ router.get("/:username", async (req, res) => {
 router.get("/:username/history", async (req, res) => {
   const username = String(req.params.username);
 
-  const { data: profiles } = await req.supabase
-    .from("profiles")
-    .select("id, is_private")
-    .eq("username", username)
-    .limit(1);
-
-  const profile = profiles?.[0];
+  const { profile: resolved, error: profileError } = await resolveProfileByUsername(
+    req.supabase,
+    username,
+    req.user.id,
+    "id, is_private",
+  );
+  if (profileError) { serverError(res, profileError); return; }
+  const profile = resolved as { id: string; is_private: boolean } | null;
   if (!profile) { res.status(404).json({ error: "User not found" }); return; }
 
   // The gated result differs by viewer (owner sees full history, others see []
@@ -135,13 +171,14 @@ router.get("/:username/history", async (req, res) => {
 router.get("/:username/friends", async (req, res) => {
   const username = String(req.params.username);
 
-  const { data: profiles } = await req.supabase
-    .from("profiles")
-    .select("id, is_private")
-    .eq("username", username)
-    .limit(1);
-
-  const profile = profiles?.[0];
+  const { profile: resolved, error: profileError } = await resolveProfileByUsername(
+    req.supabase,
+    username,
+    req.user.id,
+    "id, is_private",
+  );
+  if (profileError) { serverError(res, profileError); return; }
+  const profile = resolved as { id: string; is_private: boolean } | null;
   if (!profile) { res.status(404).json({ error: "User not found" }); return; }
 
   const cacheKey = `user-friends:${profile.id}:${req.user.id === profile.id ? "own" : "pub"}`;
@@ -170,13 +207,14 @@ router.get("/:username/friends", async (req, res) => {
 router.get("/:username/active-session", async (req, res) => {
   const username = String(req.params.username);
 
-  const { data: profiles } = await req.supabase
-    .from("profiles")
-    .select("id, is_private")
-    .eq("username", username)
-    .limit(1);
-
-  const profile = profiles?.[0];
+  const { profile: resolved, error: profileError } = await resolveProfileByUsername(
+    req.supabase,
+    username,
+    req.user.id,
+    "id, is_private",
+  );
+  if (profileError) { serverError(res, profileError); return; }
+  const profile = resolved as { id: string; is_private: boolean } | null;
   if (!profile) { res.status(404).json({ error: "User not found" }); return; }
 
   if (profile.is_private && profile.id !== req.user.id) {
