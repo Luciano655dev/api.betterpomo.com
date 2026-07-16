@@ -4,7 +4,7 @@
 // concurrent API instances), then sends via Resend.
 
 import { adminDb } from "./supabase";
-import { sendEmail, unsubscribeUrl, emailConfigured } from "./email";
+import { renderBrandedEmail, sendEmail, unsubscribeUrl, emailConfigured } from "./email";
 import { WAITLIST_SEQUENCE, USER_SEQUENCE, type SequenceStep } from "./sequences";
 
 const TICK_MS = 60 * 60_000; // hourly
@@ -38,6 +38,7 @@ async function sendStep(step: SequenceStep, recipient: string, userId?: string):
     to: recipient,
     subject: step.subject,
     text: step.body.replaceAll("{{unsubscribe}}", unsub),
+    html: renderBrandedEmail({ ...step.content, unsubscribe: unsub }),
     unsubscribe: unsub,
   });
   return true;

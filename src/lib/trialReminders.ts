@@ -5,22 +5,21 @@
 // Multi-instance safe: the UPDATE … RETURNING claims rows by flipping
 // trial_reminder_sent first, so two instances can never send twice.
 import { adminDb } from "./supabase";
-import { sendEmail } from "./email";
+import { renderBrandedEmail, sendEmail } from "./email";
 import { BILLING_ENABLED } from "./plans";
 import { notifySystem } from "./notify";
 
 const SWEEP_INTERVAL_MS = 60 * 60_000; // hourly
 const REMINDER_WINDOW_MS = 48 * 60 * 60_000; // notify when ≤ 2 days remain
 
-function reminderEmail(displayName: string, trialEndsAt: string): { subject: string; text: string } {
+function reminderEmail(displayName: string, trialEndsAt: string): { subject: string; text: string; html: string } {
   const endDate = new Date(trialEndsAt).toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
     day: "numeric",
   });
-  return {
-    subject: "Your BetterPomo Pro trial ends in 2 days",
-    text: `Hey ${displayName},
+  const subject = "Your BetterPomo Pro trial ends in 2 days";
+  const text = `Hey ${displayName},
 
 Your 7-day Pro trial wraps up on ${endDate} — and here's the good news: nothing changes. Your full history, private sessions, custom timers, and everything else you've been using stays exactly as it is. Your Pro subscription simply starts that day.
 
@@ -37,7 +36,28 @@ Pro is $4.99/month or $29.99/year (that's about $2.50/month). It's the best way 
 Prefer not to continue? No hard feelings — you can cancel anytime before ${endDate} from Settings → Plan & billing, and you won't be charged.
 
 Keep focusing,
-The BetterPomo team`,
+The BetterPomo team`;
+  return {
+    subject,
+    text,
+    html: renderBrandedEmail({
+      preview: `Your Pro trial wraps up on ${endDate}.`,
+      eyebrow: "BetterPomo Pro",
+      heading: "Your trial ends in two days",
+      paragraphs: [
+        `Hey ${displayName}, your seven-day Pro trial wraps up on ${endDate}. Your Pro subscription will begin that day, and everything you’ve set up will keep working exactly as it does now.`,
+        "You’ve already built momentum this week. Keeping Pro means keeping every minute of it:",
+      ],
+      bullets: [
+        "Your complete focus history and stats—nothing gets locked away.",
+        "Private and password-protected sessions.",
+        "Up to 25 people in a session and 10 custom timers.",
+        "The full ambient sound library, uploads, session templates, and CSV exports.",
+      ],
+      notice: `Prefer not to continue? Cancel before ${endDate} from Settings → Plan & billing and you won’t be charged.`,
+      action: { label: "Manage your plan", url: "https://app.betterpomo.com/settings" },
+      signoff: "Keep focusing,\nThe BetterPomo team",
+    }),
   };
 }
 
@@ -69,8 +89,8 @@ async function sweep(): Promise<void> {
     const { data: authUser } = await adminDb.auth.admin.getUserById(row.id);
     const email = authUser?.user?.email;
     if (email) {
-      const { subject, text } = reminderEmail(row.display_name ?? row.username, row.trial_ends_at);
-      await sendEmail({ to: email, subject, text });
+      const { subject, text, html } = reminderEmail(row.display_name ?? row.username, row.trial_ends_at);
+      await sendEmail({ to: email, subject, text, html });
     }
   }
 
