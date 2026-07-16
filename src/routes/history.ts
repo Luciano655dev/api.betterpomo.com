@@ -4,6 +4,7 @@ import { serverError } from "../lib/http";
 import { cache, TTL } from "../lib/cache";
 import { clampInt } from "../lib/utils";
 import { getUserEntitlements, upgradeRequired } from "../lib/plans";
+import { getSessionTimeMetrics } from "../lib/sessionTime";
 
 const router = Router();
 
@@ -39,7 +40,7 @@ router.get("/", authenticate, async (req, res) => {
 
   let query = supabase
     .from("pomodoro_history")
-    .select("id, session_id, session_name, timers_used, participants, duration_seconds, completed_at, tasks")
+    .select("id, session_id, session_name, timers_used, participants, duration_seconds, focus_seconds, completed_at, tasks")
     .eq("user_id", user.id);
   if (cutoff) query = query.gte("completed_at", cutoff);
   if (from && !Number.isNaN(Date.parse(from))) query = query.gte("completed_at", new Date(Date.parse(from)).toISOString());
@@ -172,8 +173,11 @@ router.post("/", authenticate, async (req, res) => {
     completedAt = new Date(Math.min(t, Date.now())).toISOString();
   }
 
-  // Real accumulated work-timer time, measured client-side. Optional (older
-  // clients / legacy rows omit it); clamped so it can never exceed wall-clock.
+  let durationSeconds = Math.floor(body.duration_seconds);
+
+  // Offline sessions have no server timer state, so measured client focus time
+  // is accepted. Online sessions override both values below with the database's
+  // authoritative participant/timer accounting.
   let focusSeconds: number | undefined;
   if (body.focus_seconds !== undefined) {
     if (typeof body.focus_seconds !== "number" || body.focus_seconds < 0) {
@@ -225,6 +229,21 @@ router.post("/", authenticate, async (req, res) => {
   const sourceSessionId = typeof body.session_id === "string" && body.session_id
     ? body.session_id
     : null;
+  let hasAuthoritativeMetrics = false;
+  if (sourceSessionId) {
+    try {
+      const metrics = await getSessionTimeMetrics(supabase, sourceSessionId, user.id);
+      if (metrics) {
+        hasAuthoritativeMetrics = true;
+        durationSeconds = metrics.totalSeconds;
+        focusSeconds = metrics.focusSeconds;
+      }
+    } catch (metricsError) {
+      serverError(res, metricsError);
+      return;
+    }
+  }
+
   if (sourceSessionId) {
     const { data: existingSession, error: existingSessionError } = await supabase
       .from("pomodoro_history")
@@ -233,7 +252,36 @@ router.post("/", authenticate, async (req, res) => {
       .eq("source_session_id", sourceSessionId)
       .maybeSingle();
     if (existingSessionError) { serverError(res, existingSessionError); return; }
-    if (existingSession) { res.json({ data: existingSession }); return; }
+    if (existingSession) {
+      // If inactivity cleanup already archived and deleted the live session,
+      // the RPC has no participant row left. Keep those authoritative values
+      // instead of replacing them with a stale client-side approximation.
+      if (!hasAuthoritativeMetrics) {
+        durationSeconds = existingSession.duration_seconds ?? durationSeconds;
+        focusSeconds = existingSession.focus_seconds ?? focusSeconds;
+      }
+      const { data: updatedExisting, error: updateExistingError } = await supabase
+        .from("pomodoro_history")
+        .update({
+          session_name: body.session_name.trim(),
+          timers_used: body.timers_used ?? [],
+          participants: body.participants ?? [],
+          duration_seconds: durationSeconds,
+          ...(focusSeconds !== undefined ? { focus_seconds: focusSeconds } : {}),
+          tasks,
+          completed_at: completedAt ?? new Date().toISOString(),
+        })
+        .eq("id", existingSession.id)
+        .eq("user_id", user.id)
+        .select()
+        .single();
+      if (updateExistingError) { serverError(res, updateExistingError); return; }
+      cache.delByPrefix(`history:${user.id}:`);
+      cache.del(`history-summary:${user.id}`);
+      cache.delByPrefix("user-hist:");
+      res.json({ data: updatedExisting });
+      return;
+    }
   }
 
   const row = {
@@ -244,7 +292,7 @@ router.post("/", authenticate, async (req, res) => {
     was_private: wasPrivate,
     timers_used: body.timers_used ?? [],
     participants: body.participants ?? [],
-    duration_seconds: Math.floor(body.duration_seconds),
+    duration_seconds: durationSeconds,
     ...(focusSeconds !== undefined ? { focus_seconds: focusSeconds } : {}),
     tasks,
     ...(completedAt ? { completed_at: completedAt } : {}),
@@ -310,7 +358,20 @@ router.patch("/:id", authenticate, async (req, res) => {
 
   const patch: Record<string, unknown> = {};
   if (typeof body.session_name === "string" && body.session_name.trim()) patch.session_name = body.session_name.trim();
-  if (typeof body.duration_seconds === "number" && body.duration_seconds >= 0) patch.duration_seconds = Math.floor(body.duration_seconds);
+  if (typeof body.duration_seconds === "number" && body.duration_seconds >= 0) {
+    const nextDuration = Math.floor(body.duration_seconds);
+    patch.duration_seconds = nextDuration;
+    const { data: existing, error: existingError } = await supabase
+      .from("pomodoro_history")
+      .select("focus_seconds")
+      .eq("id", id)
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (existingError) { serverError(res, existingError); return; }
+    if (existing?.focus_seconds != null) {
+      patch.focus_seconds = Math.min(existing.focus_seconds, nextDuration);
+    }
+  }
   if (!Object.keys(patch).length) { res.status(400).json({ error: "Nothing to update" }); return; }
 
   const { data, error } = await supabase

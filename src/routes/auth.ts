@@ -7,6 +7,13 @@ const router = Router();
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
+const EMAIL_CODE_RE = /^\d{6}$/;
+
+function publicSession(session: { access_token: string; refresh_token: string } | null) {
+  return session
+    ? { access_token: session.access_token, refresh_token: session.refresh_token }
+    : null;
+}
 
 /** Where password-reset emails land. The Supabase link goes through the webapp's
  *  OAuth callback (which exchanges the code for a session) and then on to the
@@ -76,11 +83,76 @@ router.post("/register", async (req, res) => {
   res.json({
     data: {
       user: data.user ? { id: data.user.id, email: data.user.email } : null,
-      session: data.session
-        ? { access_token: data.session.access_token, refresh_token: data.session.refresh_token }
-        : null,
+      session: publicSession(data.session),
     },
   });
+});
+
+/**
+ * POST /api/auth/verify-email — PUBLIC.
+ * Body: { email, token }
+ *
+ * Confirms a newly-created account with the six-digit code from Supabase and
+ * returns the resulting session so web and mobile can sign the user in without
+ * asking for their password again.
+ */
+router.post("/verify-email", async (req, res) => {
+  const rawEmail = req.body?.email;
+  const rawToken = req.body?.token;
+  const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
+  const token = typeof rawToken === "string" ? rawToken.trim() : "";
+
+  if (!email || email.length > 254 || !EMAIL_RE.test(email)) {
+    res.status(400).json({ error: "Enter a valid email address" });
+    return;
+  }
+  if (!EMAIL_CODE_RE.test(token)) {
+    res.status(400).json({ error: "Enter the 6-digit code from your email" });
+    return;
+  }
+
+  const anon = createAnonClient();
+  const { data, error } = await anon.auth.verifyOtp({ email, token, type: "email" });
+  if (error) {
+    res.status(400).json({ error: "That code is invalid or has expired. Request a new code and try again." });
+    return;
+  }
+  if (!data.session) {
+    res.status(400).json({ error: "Email confirmed, but a session could not be created. Please sign in." });
+    return;
+  }
+
+  res.json({
+    data: {
+      user: data.user ? { id: data.user.id, email: data.user.email } : null,
+      session: publicSession(data.session),
+    },
+  });
+});
+
+/**
+ * POST /api/auth/resend-verification — PUBLIC.
+ * Body: { email }
+ *
+ * Sends a fresh signup code. Supabase applies its own per-address cooldown in
+ * addition to the API's per-IP email rate limit.
+ */
+router.post("/resend-verification", async (req, res) => {
+  const rawEmail = req.body?.email;
+  const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
+  if (!email || email.length > 254 || !EMAIL_RE.test(email)) {
+    res.status(400).json({ error: "Enter a valid email address" });
+    return;
+  }
+
+  const anon = createAnonClient();
+  const { error } = await anon.auth.resend({ type: "signup", email });
+  if (error) {
+    res.status(400).json({ error: error.message });
+    return;
+  }
+
+  res.json({ data: { ok: true } });
 });
 
 /**

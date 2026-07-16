@@ -145,7 +145,7 @@ router.get("/:username/history", async (req, res) => {
 
   let query = req.supabase
     .from("pomodoro_history")
-    .select("id, session_name, timers_used, participants, duration_seconds, completed_at, tasks")
+    .select("id, session_name, timers_used, participants, duration_seconds, focus_seconds, completed_at, tasks")
     .eq("user_id", profile.id)
     .order("completed_at", { ascending: false })
     .range(0, PUBLIC_HISTORY_MAX - 1);

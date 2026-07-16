@@ -146,17 +146,31 @@ app.use("/api/email", emailRouter);
 app.use("/api/billing", billingRouter);
 app.use("/api/templates", templatesRouter);
 
-// Public auth endpoints (register / forgot-password) are unauthenticated and
-// email-sending — cap them as hard as the wishlist to blunt abuse.
-const authLimiter = rateLimit({
+// Account creation, resend and recovery all send email. Keep their shared
+// budget tight while allowing enough code attempts for normal typing mistakes.
+const authEmailLimiter = rateLimit({
   windowMs: 60 * 60_000,
   limit: 10,
   standardHeaders: "draft-7",
   legacyHeaders: false,
   message: { error: "Too many attempts, please try again later." },
-  ...(redis ? { store: makeRedisStore("rl:auth:") } : {}),
+  ...(redis ? { store: makeRedisStore("rl:auth-email:") } : {}),
 });
-app.use("/api/auth", authLimiter, authRouter);
+
+const authVerificationLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 30,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many incorrect codes, please try again later." },
+  ...(redis ? { store: makeRedisStore("rl:auth-verify:") } : {}),
+});
+
+app.use("/api/auth/register", authEmailLimiter);
+app.use("/api/auth/forgot-password", authEmailLimiter);
+app.use("/api/auth/resend-verification", authEmailLimiter);
+app.use("/api/auth/verify-email", authVerificationLimiter);
+app.use("/api/auth", authRouter);
 
 // 404 for unknown API routes.
 app.use((_req, res) => { res.status(404).json({ error: "Not found" }); });

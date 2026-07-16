@@ -7,6 +7,7 @@ import { perUserLimiter } from "../middleware/rateLimit";
 import { generateSessionCode, clampInt, escapeLike } from "../lib/utils";
 import { cache, TTL } from "../lib/cache";
 import { createAuthClient } from "../lib/supabase";
+import { getSessionTimeMetrics } from "../lib/sessionTime";
 import {
   BILLING_ENABLED,
   getEntitlements,
@@ -967,6 +968,17 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
       ]);
 
       if (sessionData && myParticipant) {
+        let metrics;
+        try {
+          metrics = await getSessionTimeMetrics(supabase, String(id), user.id);
+        } catch (metricsError) {
+          serverError(res, metricsError);
+          return;
+        }
+        const durationSeconds = metrics?.totalSeconds ?? Math.floor(
+          (Date.now() - new Date((myParticipant as { joined_at: string }).joined_at).getTime()) / 1000
+        );
+        const focusSeconds = metrics?.focusSeconds;
         const { data: existing } = await supabase
           .from("pomodoro_history")
           .select("id")
@@ -974,31 +986,39 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
           .eq("user_id", user.id)
           .maybeSingle();
 
-        if (!existing) {
-          const durationSeconds = Math.floor(
-            (Date.now() - new Date((myParticipant as { joined_at: string }).joined_at).getTime()) / 1000
-          );
-          await supabase.from("pomodoro_history").insert({
-            session_id: id,
-            source_session_id: id,
-            user_id: user.id,
-            session_name: (sessionData as { name: string }).name,
-            was_private: (sessionData as { is_private?: boolean }).is_private ?? false,
-            timers_used: (timersData ?? []).map((t: { name: string; duration: number }) => ({
-              name: t.name,
-              duration: t.duration,
-            })),
-            participants: (allParticipants ?? []).map((p) => ({
-              username: (p as unknown as { profiles: { username: string; display_name: string } | null }).profiles?.username ?? "Unknown",
-              display_name: (p as unknown as { profiles: { username: string; display_name: string } | null }).profiles?.display_name
-                ?? (p as unknown as { profiles: { username: string } | null }).profiles?.username
-                ?? "Unknown",
-            })),
-            duration_seconds: durationSeconds,
-          });
-          cache.delByPrefix(`history:${user.id}:`);
-          cache.delByPrefix("user-hist:");
+        const historySnapshot = {
+          session_id: id,
+          source_session_id: id,
+          user_id: user.id,
+          session_name: (sessionData as { name: string }).name,
+          was_private: (sessionData as { is_private?: boolean }).is_private ?? false,
+          timers_used: (timersData ?? []).map((t: { name: string; duration: number }) => ({
+            name: t.name,
+            duration: t.duration,
+          })),
+          participants: (allParticipants ?? []).map((p) => ({
+            username: (p as unknown as { profiles: { username: string; display_name: string } | null }).profiles?.username ?? "Unknown",
+            display_name: (p as unknown as { profiles: { username: string; display_name: string } | null }).profiles?.display_name
+              ?? (p as unknown as { profiles: { username: string } | null }).profiles?.username
+              ?? "Unknown",
+          })),
+          duration_seconds: durationSeconds,
+          ...(focusSeconds !== undefined ? { focus_seconds: focusSeconds } : {}),
+          completed_at: new Date().toISOString(),
+        };
+
+        if (existing) {
+          await supabase
+            .from("pomodoro_history")
+            .update(historySnapshot)
+            .eq("id", existing.id)
+            .eq("user_id", user.id);
+        } else {
+          await supabase.from("pomodoro_history").insert(historySnapshot);
         }
+        cache.delByPrefix(`history:${user.id}:`);
+        cache.del(`history-summary:${user.id}`);
+        cache.delByPrefix("user-hist:");
       }
     }
 
