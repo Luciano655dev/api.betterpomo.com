@@ -11,6 +11,7 @@ import friendsRouter from "./routes/friends";
 import chatRouter from "./routes/chat";
 import notificationsRouter from "./routes/notifications";
 import wishlistRouter from "./routes/wishlist";
+import contactRouter from "./routes/contact";
 import authRouter from "./routes/auth";
 import feedbackRouter from "./routes/feedback";
 import emailRouter from "./routes/email";
@@ -56,10 +57,30 @@ const allowedOrigins = (process.env.CORS_ORIGIN ?? "http://localhost:3000")
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
+
+function isDevelopmentLoopbackOrigin(origin: string): boolean {
+  if (process.env.NODE_ENV === "production") return false;
+
+  try {
+    const { hostname, protocol } = new URL(origin);
+    const isHttp = protocol === "http:" || protocol === "https:";
+    const isLoopback = hostname === "localhost"
+      || hostname === "127.0.0.1"
+      || hostname === "[::1]";
+    return isHttp && isLoopback;
+  } catch {
+    return false;
+  }
+}
+
 app.use(cors({
   origin(origin, cb) {
     // Non-browser clients (curl, server-to-server) send no Origin — allow them.
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    // In development Next.js may move to another port when 3000 is occupied;
+    // accept loopback origins on any port without weakening production CORS.
+    if (!origin || allowedOrigins.includes(origin) || isDevelopmentLoopbackOrigin(origin)) {
+      return cb(null, true);
+    }
     cb(new Error("Not allowed by CORS"));
   },
   credentials: true,
@@ -92,8 +113,7 @@ const globalLimiter = rateLimit({
 });
 app.use("/api", globalLimiter);
 
-// The wishlist is public and unauthenticated — the one real spam surface. Cap it
-// hard: a genuine visitor signs up once.
+// Public, unauthenticated forms are the main email/spam surfaces. Cap them hard.
 const wishlistLimiter = rateLimit({
   windowMs: 60 * 60_000,
   limit: 10,
@@ -101,6 +121,15 @@ const wishlistLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: "Too many attempts, please try again later." },
   ...(redis ? { store: makeRedisStore("rl:wishlist:") } : {}),
+});
+
+const contactLimiter = rateLimit({
+  windowMs: 60 * 60_000,
+  limit: 5,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many messages, please try again later." },
+  ...(redis ? { store: makeRedisStore("rl:contact:") } : {}),
 });
 
 app.use("/api/sessions", sessionsRouter);
@@ -111,6 +140,7 @@ app.use("/api/friends", friendsRouter);
 app.use("/api/chat", chatRouter);
 app.use("/api/notifications", notificationsRouter);
 app.use("/api/wishlist", wishlistLimiter, wishlistRouter);
+app.use("/api/contact", contactLimiter, contactRouter);
 app.use("/api/feedback", feedbackRouter);
 app.use("/api/email", emailRouter);
 app.use("/api/billing", billingRouter);

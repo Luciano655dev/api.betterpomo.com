@@ -12,7 +12,7 @@ const router = Router();
 // With billing disabled they're skipped entirely — the columns may not exist
 // in a DB that hasn't run migration_billing.sql yet.
 const BASE_PROFILE_COLUMNS =
-  "id, username, emoji, bio, is_private, onboarding_completed, marketing_emails, focus_category, focus_style, focus_peak, created_at";
+  "id, username, display_name, emoji, bio, is_private, onboarding_completed, marketing_emails, focus_category, focus_style, focus_peak, created_at";
 const PROFILE_COLUMNS = BILLING_ENABLED
   ? `${BASE_PROFILE_COLUMNS}, ${PLAN_COLUMNS}`
   : BASE_PROFILE_COLUMNS;
@@ -30,8 +30,34 @@ function usernameBase(user: { id: string; email?: string; user_metadata?: Record
   const meta = user.user_metadata ?? {};
   const source = [meta.username, meta.full_name, meta.name, user.email?.split("@")[0]]
     .find((value) => typeof value === "string" && value.trim()) as string | undefined;
-  const sanitized = (source ?? "user").toLowerCase().replace(/[^a-z0-9_]/g, "").slice(0, 20);
+  const sanitized = (source ?? "user")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^a-z0-9_]/g, "")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 20);
   return sanitized.length >= 3 ? sanitized : `user_${user.id.replace(/-/g, "").slice(0, 8)}`;
+}
+
+function normalizedDisplayName(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().replace(/\s+/g, " ");
+  if (!normalized || Array.from(normalized).length > 50 || /[\u0000-\u001f\u007f]/.test(normalized)) return null;
+  return normalized;
+}
+
+function invalidateIdentity(userId: string) {
+  cache.del(`profile:${userId}`);
+  cache.delByPrefix("user:");
+  cache.delByPrefix("search:");
+  cache.delByPrefix("user-hist:");
+  cache.delByPrefix("user-friends:");
+  cache.delByPrefix("friends:");
+  cache.delByPrefix("friend-reqs:");
+  cache.delByPrefix("conversations:");
+  cache.delByPrefix("feedback:");
 }
 
 function usernameCandidate(base: string, attempt: number, userId: string): string {
@@ -82,7 +108,12 @@ router.get("/", authenticate, async (req, res) => {
     for (let attempt = 0; attempt <= 51; attempt += 1) {
       const result = await supabase
         .from("profiles")
-        .insert({ id: user.id, username: usernameCandidate(base, attempt, user.id), emoji: "🍅" })
+        .insert({
+          id: user.id,
+          username: usernameCandidate(base, attempt, user.id),
+          display_name: usernameCandidate(base, attempt, user.id),
+          emoji: "🍅",
+        })
         .select(PROFILE_COLUMNS)
         .single();
       if (!result.error) {
@@ -118,7 +149,7 @@ router.get("/", authenticate, async (req, res) => {
 });
 
 /** PATCH /api/profile
- *  Body: { username?, emoji?, bio?, is_private?, onboarding_completed? } */
+ *  Body: { username?, display_name?, emoji?, bio?, is_private?, onboarding_completed? } */
 router.patch("/", authenticate, async (req, res) => {
   const { user, supabase } = req;
   const body = req.body;
@@ -130,8 +161,12 @@ router.patch("/", authenticate, async (req, res) => {
   if (body.username !== undefined && !USERNAME_RE.test(String(body.username).trim().toLowerCase())) {
     res.status(400).json({ error: "Username must be 3-24 characters: lowercase letters, numbers, underscores" }); return;
   }
+  if (body.display_name !== undefined && normalizedDisplayName(body.display_name) === null) {
+    res.status(400).json({ error: "Display name must be 1-50 characters" }); return;
+  }
   const patch: Record<string, unknown> = {};
   if (typeof body.username === "string" && body.username.trim()) patch.username = body.username.trim().toLowerCase();
+  if (body.display_name !== undefined) patch.display_name = normalizedDisplayName(body.display_name);
   if (typeof body.emoji === "string" && body.emoji.trim()) patch.emoji = body.emoji.trim();
   if (body.bio === null || typeof body.bio === "string") patch.bio = body.bio ?? null;
   if (typeof body.is_private === "boolean") patch.is_private = body.is_private;
@@ -162,15 +197,53 @@ router.patch("/", authenticate, async (req, res) => {
   // privacy (is_private) toggle also flips whether this user's public history
   // and friends list are visible, so drop those gated caches too. Then
   // immediately re-populate the profile cache with the fresh value.
-  cache.del(`profile:${user.id}`);
-  cache.delByPrefix("user:");
-  cache.delByPrefix("search:");
-  cache.delByPrefix("user-hist:");
-  cache.delByPrefix("user-friends:");
+  invalidateIdentity(user.id);
   const enriched = withEntitlements(data as Partial<PlanRow>);
   cache.set(`profile:${user.id}`, enriched, TTL.PROFILE);
 
   res.json({ data: enriched });
+});
+
+/** POST /api/profile/initialize-oauth-identity
+ * Native Apple returns the person's name outside its ID token. During first-run
+ * onboarding, allocate that provider name as both the handle and display name. */
+router.post("/initialize-oauth-identity", authenticate, async (req, res) => {
+  const { user, supabase } = req;
+  const providerName = normalizedDisplayName(req.body?.provider_name);
+  if (!providerName) { res.status(400).json({ error: "A valid provider_name is required" }); return; }
+  if (!(user.identities ?? []).some((identity) => identity.provider === "apple" || identity.provider === "google")) {
+    res.status(403).json({ error: "OAuth identity required" }); return;
+  }
+
+  const { data: current, error: currentError } = await supabase
+    .from("profiles")
+    .select("id, onboarding_completed")
+    .eq("id", user.id)
+    .single();
+  if (currentError) { serverError(res, currentError); return; }
+  if (current.onboarding_completed) {
+    res.status(409).json({ error: "Identity is already initialized" }); return;
+  }
+
+  const base = usernameBase({ id: user.id, user_metadata: { name: providerName } });
+  for (let attempt = 0; attempt <= 51; attempt += 1) {
+    const candidate = usernameCandidate(base, attempt, user.id);
+    const result = await supabase
+      .from("profiles")
+      .update({ username: candidate, display_name: candidate })
+      .eq("id", user.id)
+      .select(PROFILE_COLUMNS)
+      .single();
+    if (!result.error) {
+      invalidateIdentity(user.id);
+      const enriched = withEntitlements(result.data as Partial<PlanRow>);
+      cache.set(`profile:${user.id}`, enriched, TTL.PROFILE);
+      res.json({ data: enriched });
+      return;
+    }
+    if (result.error.code !== "23505") { serverError(res, result.error); return; }
+  }
+  serverError(res, new Error("Could not allocate a unique username"));
 });
 
 /** POST /api/profile/password — change the account password.

@@ -29,21 +29,19 @@ leave. To stop abandoned memberships from lingering forever:
   server-side to at most once / 5 min per user (`touchLastSeen`) so a 3–15s poll
   cadence doesn't become thousands of writes/sec — 5-min granularity is
   irrelevant against a 24h window.
-- **Sweep.** `cleanup_inactive_participants()` (pg_cron, every 15 min) mirrors
-  the API's explicit-leave logic for every membership whose `last_seen_at` is
-  >24h old: saves history (deduped), sets `left_at`, transfers ownership when the
-  owner is the one leaving, then deletes sessions left with zero active members.
+- **Sweep.** `cleanup_inactive_participants()` (pg_cron, every 15 min) first
+  finds sessions with no meaningful change and no owner/admin heartbeat for
+  >24h. It atomically archives every active participant and deletes the room.
+  It then applies the participant-level save/removal logic to inactive people
+  in otherwise healthy sessions.
 
 Net effect: keep the app open anywhere within 24h → you stay in. Fully
 closed/backgrounded for 24h → you're removed and the session is torn down if
 you were the last one.
 
-▶ **Interaction with the existing 72h sweep.** `cleanup_stale_sessions()`
-(`migration_background_sessions.sql`) deletes any session older than 72h *by
-`created_at`, regardless of activity* — so it will also kill a genuinely-active
-session that has run for 3 days. With the inactivity sweep now handling
-abandonment, consider raising that cap or re-basing it on activity. Left as-is
-here to avoid changing existing behaviour without a call.
+▶ **The old 72h sweep is retired.** `cleanup_stale_sessions()` used creation
+time and could delete a busy long-running room without archiving it. The new
+24h activity + manager-heartbeat rule is the only scheduled session expiry.
 
 ## 2. Hot-path indexes ✅
 

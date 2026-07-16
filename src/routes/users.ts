@@ -60,11 +60,15 @@ router.get("/search", async (req, res) => {
 
   let query = req.supabase
     .from("profiles")
-    .select("id, username, emoji, bio, is_private", { count: "exact" })
-    .order("username")
+    .select("id, username, display_name, emoji, bio, is_private", { count: "exact" })
+    .order("display_name")
     .range(from, to);
 
-  if (q) query = query.ilike("username", `%${escapeLike(q)}%`);
+  if (q) {
+    // PostgREST's raw `.or()` filter treats commas/parentheses as syntax.
+    const escaped = escapeLike(q).replace(/[(),]/g, "");
+    query = query.or(`username.ilike.%${escaped}%,display_name.ilike.%${escaped}%`);
+  }
 
   const { data, count, error } = await query;
 
@@ -82,8 +86,8 @@ router.get("/:username", async (req, res) => {
 
   // Typed as plain string so supabase-js doesn't literal-parse the union.
   const publicColumns: string = BILLING_ENABLED
-    ? "id, username, emoji, bio, is_private, plan, plan_status, plan_period_end"
-    : "id, username, emoji, bio, is_private";
+    ? "id, username, display_name, emoji, bio, is_private, plan, plan_status, plan_period_end"
+    : "id, username, display_name, emoji, bio, is_private";
   const { profile, error } = await resolveProfileByUsername(
     req.supabase,
     username,

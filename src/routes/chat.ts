@@ -26,10 +26,14 @@ async function resolveUserId(supabase: SupabaseClient, username: string) {
   return data?.[0]?.id ?? null;
 }
 
-/** Fetch the actor's username/emoji to snapshot into notification metadata. */
+/** Fetch the actor's identity to snapshot into notification metadata. */
 async function actorSnapshot(supabase: SupabaseClient, userId: string) {
-  const { data } = await supabase.from("profiles").select("username, emoji").eq("id", userId).single();
-  return { username: data?.username ?? "Someone", emoji: data?.emoji ?? "🍅" };
+  const { data } = await supabase.from("profiles").select("username, display_name, emoji").eq("id", userId).single();
+  return {
+    username: data?.username ?? "someone",
+    display_name: data?.display_name ?? data?.username ?? "Someone",
+    emoji: data?.emoji ?? "🍅",
+  };
 }
 
 /** Message alerts are push-only; unread state remains owned by Conversations. */
@@ -53,13 +57,14 @@ async function pushNewMessage(
       "messages",
       `chat_message:${messageId}`,
       {
-        title: actor.username,
+        title: actor.display_name,
         body: conversation?.is_group ? `New message in ${groupTitle}` : "Sent you a message",
         data: {
           type: "chat_message",
           conversation_id: conversationId,
           sender_id: senderId,
           username: actor.username,
+          display_name: actor.display_name,
         },
         collapseId: `chat:${conversationId}`,
       },

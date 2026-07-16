@@ -91,6 +91,25 @@ router.get("/summary", authenticate, async (req, res) => {
   res.json({ data });
 });
 
+/** GET /api/history/session/:sessionId — the caller's archived copy of a
+ * session. source_session_id survives the session row's ON DELETE SET NULL and
+ * lets clients recover the server-created recap after inactivity expiry. */
+router.get("/session/:sessionId", authenticate, async (req, res) => {
+  const { user, supabase } = req;
+  const { sessionId } = req.params;
+  const { data, error } = await supabase
+    .from("pomodoro_history")
+    .select("id, session_id, session_name, timers_used, participants, duration_seconds, focus_seconds, completed_at, tasks")
+    .eq("user_id", user.id)
+    .eq("source_session_id", sessionId)
+    .maybeSingle();
+  if (error) { serverError(res, error); return; }
+  if (!data) { res.status(404).json({ error: "Archived session not found" }); return; }
+  cache.delByPrefix(`history:${user.id}:`);
+  cache.del(`history-summary:${user.id}`);
+  res.json({ data });
+});
+
 /** GET /api/history/export — full history as CSV (Pro: advanced analytics). */
 router.get("/export", authenticate, async (req, res) => {
   const { user, supabase } = req;
@@ -201,9 +220,26 @@ router.post("/", authenticate, async (req, res) => {
     if (dupe) { res.json({ data: dupe }); return; }
   }
 
+  // Session history is also idempotent across automatic inactivity expiry.
+  // The source id remains available after the live session FK is nulled.
+  const sourceSessionId = typeof body.session_id === "string" && body.session_id
+    ? body.session_id
+    : null;
+  if (sourceSessionId) {
+    const { data: existingSession, error: existingSessionError } = await supabase
+      .from("pomodoro_history")
+      .select()
+      .eq("user_id", user.id)
+      .eq("source_session_id", sourceSessionId)
+      .maybeSingle();
+    if (existingSessionError) { serverError(res, existingSessionError); return; }
+    if (existingSession) { res.json({ data: existingSession }); return; }
+  }
+
   const row = {
     user_id: user.id,
     session_id: body.session_id ?? null,
+    source_session_id: sourceSessionId,
     session_name: body.session_name.trim(),
     was_private: wasPrivate,
     timers_used: body.timers_used ?? [],
@@ -226,14 +262,14 @@ router.post("/", authenticate, async (req, res) => {
   }
 
   // Deferred uploads (offline clients) can conflict with what happened since:
-  // - 23505: the leave safety-net already saved this (session_id, user_id) —
+  // - 23505: the leave/expiry safety-net already saved this source session —
   //   idempotent success, return the existing row instead of erroring.
   // - 23503: the session row was deleted meanwhile — keep the entry, unlinked.
   if (error?.code === "23505" && body.session_id) {
     const { data: existing } = await supabase
       .from("pomodoro_history")
       .select()
-      .eq("session_id", body.session_id)
+      .eq("source_session_id", body.session_id)
       .eq("user_id", user.id)
       .maybeSingle();
     if (existing) { res.json({ data: existing }); return; }
@@ -244,6 +280,15 @@ router.post("/", authenticate, async (req, res) => {
       .insert({ ...row, session_id: null })
       .select()
       .single());
+    if (error?.code === "23505" && sourceSessionId) {
+      const { data: existing } = await supabase
+        .from("pomodoro_history")
+        .select()
+        .eq("source_session_id", sourceSessionId)
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (existing) { res.json({ data: existing }); return; }
+    }
   }
 
   if (error) { serverError(res, error); return; }

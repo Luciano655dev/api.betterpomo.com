@@ -451,7 +451,7 @@ router.get<{ id: string }>("/:id", authenticate, async (req, res) => {
     supabase.from("timers").select("*").eq("session_id", id).order("order"),
     supabase
       .from("session_participants")
-      .select("id, user_id, role, joined_at, left_at, last_seen_at, profiles(username, emoji)")
+      .select("id, user_id, role, joined_at, left_at, last_seen_at, profiles(username, display_name, emoji)")
       .eq("session_id", id)
       .order("joined_at"),
   ]);
@@ -652,6 +652,15 @@ router.patch("/:id", authenticate, async (req, res) => {
         res.status(400).json({ error: `Unknown action: ${body.action}` }); return;
     }
 
+    // Some actions (for example changing session type while idle) do not alter
+    // the legacy timer columns watched by the DB trigger. Mark every successful
+    // manager action explicitly so all of them reset the 24h expiry clock.
+    const { error: activityError } = await supabase
+      .from("pomodoro_sessions")
+      .update({ last_activity_at: now.toISOString() })
+      .eq("id", id);
+    if (activityError) { serverError(res, activityError); return; }
+
     const { data: updated } = await supabase.from("pomodoro_sessions").select("*").eq("id", id).single();
     res.json({ data: { session: updated } });
     return;
@@ -668,6 +677,7 @@ router.patch("/:id", authenticate, async (req, res) => {
     patch.password_hash = body.password ? await bcrypt.hash(body.password, 10) : null;
   }
   if (!Object.keys(patch).length) { res.status(400).json({ error: "Nothing to update" }); return; }
+  patch.last_activity_at = new Date().toISOString();
 
   // Turning privacy ON (or setting a password) is a Pro feature; turning it
   // off or clearing a password is always allowed.
@@ -875,19 +885,19 @@ router.get("/:id/participants", authenticate, async (req, res) => {
     .from("session_participants")
     .select(
       BILLING_ENABLED
-        ? "id, user_id, role, joined_at, left_at, profiles(username, emoji, plan, plan_status, plan_period_end)"
-        : "id, user_id, role, joined_at, left_at, profiles(username, emoji)",
+        ? "id, user_id, role, joined_at, left_at, profiles(username, display_name, emoji, plan, plan_status, plan_period_end)"
+        : "id, user_id, role, joined_at, left_at, profiles(username, display_name, emoji)",
     )
     .eq("session_id", id)
     .order("joined_at");
   if (error) { serverError(res, error); return; }
   // Expose a computed badge, never raw billing columns.
   const withBadges = ((data ?? []) as Record<string, unknown>[]).map((p) => {
-    const prof = p.profiles as (Partial<PlanRow> & { username?: string; emoji?: string }) | null;
+    const prof = p.profiles as (Partial<PlanRow> & { username?: string; display_name?: string; emoji?: string }) | null;
     return {
       ...p,
       profiles: prof
-        ? { username: prof.username, emoji: prof.emoji, badge: getEntitlements(prof).badge }
+        ? { username: prof.username, display_name: prof.display_name, emoji: prof.emoji, badge: getEntitlements(prof).badge }
         : prof,
     };
   });
@@ -896,16 +906,21 @@ router.get("/:id/participants", authenticate, async (req, res) => {
 
 /** PATCH /api/sessions/:id/participants/me
  *  Update the current user's own presence (left_at).
- *  Body: { left_at: string | null }
+ *  Body: { left_at: string | null, save_history?: boolean }
  *  On leave (left_at !== null): transfers ownership if this user is the owner,
- *  or ends the session if they are the last active participant. */
+ *  or ends the session if they are the last active participant. History is
+ *  saved by default for backward compatibility; pass save_history: false to
+ *  leave without adding the session to history. */
 router.patch("/:id/participants/me", authenticate, async (req, res) => {
   const { user, supabase } = req;
   const { id } = req.params;
-  const { left_at } = req.body ?? {};
+  const { left_at, save_history } = req.body ?? {};
 
   if (left_at === undefined) {
     res.status(400).json({ error: "left_at is required" }); return;
+  }
+  if (save_history !== undefined && typeof save_history !== "boolean") {
+    res.status(400).json({ error: "save_history must be a boolean" }); return;
   }
 
   // Capture role before leaving. A user may only change their own presence in a
@@ -937,47 +952,53 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
     // its failures are swallowed, so relying on it silently drops sessions from
     // the user's stats whenever it doesn't land (e.g. leaving while others
     // remain). The (session_id, user_id) existence check dedupes against a
-    // successful client save.
-    const [
-      { data: sessionData },
-      { data: myParticipant },
-      { data: timersData },
-      { data: allParticipants },
-    ] = await Promise.all([
-      supabase.from("pomodoro_sessions").select("name, is_private").eq("id", id).single(),
-      supabase.from("session_participants").select("joined_at").eq("session_id", id).eq("user_id", user.id).single(),
-      supabase.from("timers").select("name, duration").eq("session_id", id).order("order"),
-      supabase.from("session_participants").select("user_id, profiles(username)").eq("session_id", id),
-    ]);
+    // successful client save. A user can explicitly opt out via save_history.
+    if (save_history !== false) {
+      const [
+        { data: sessionData },
+        { data: myParticipant },
+        { data: timersData },
+        { data: allParticipants },
+      ] = await Promise.all([
+        supabase.from("pomodoro_sessions").select("name, is_private").eq("id", id).single(),
+        supabase.from("session_participants").select("joined_at").eq("session_id", id).eq("user_id", user.id).single(),
+        supabase.from("timers").select("name, duration").eq("session_id", id).order("order"),
+        supabase.from("session_participants").select("user_id, profiles(username, display_name)").eq("session_id", id),
+      ]);
 
-    if (sessionData && myParticipant) {
-      const { data: existing } = await supabase
-        .from("pomodoro_history")
-        .select("id")
-        .eq("session_id", id)
-        .eq("user_id", user.id)
-        .maybeSingle();
+      if (sessionData && myParticipant) {
+        const { data: existing } = await supabase
+          .from("pomodoro_history")
+          .select("id")
+          .eq("session_id", id)
+          .eq("user_id", user.id)
+          .maybeSingle();
 
-      if (!existing) {
-        const durationSeconds = Math.floor(
-          (Date.now() - new Date((myParticipant as { joined_at: string }).joined_at).getTime()) / 1000
-        );
-        await supabase.from("pomodoro_history").insert({
-          session_id: id,
-          user_id: user.id,
-          session_name: (sessionData as { name: string }).name,
-          was_private: (sessionData as { is_private?: boolean }).is_private ?? false,
-          timers_used: (timersData ?? []).map((t: { name: string; duration: number }) => ({
-            name: t.name,
-            duration: t.duration,
-          })),
-          participants: (allParticipants ?? []).map((p) => ({
-            username: (p as unknown as { profiles: { username: string } | null }).profiles?.username ?? "Unknown",
-          })),
-          duration_seconds: durationSeconds,
-        });
-        cache.delByPrefix(`history:${user.id}:`);
-        cache.delByPrefix("user-hist:");
+        if (!existing) {
+          const durationSeconds = Math.floor(
+            (Date.now() - new Date((myParticipant as { joined_at: string }).joined_at).getTime()) / 1000
+          );
+          await supabase.from("pomodoro_history").insert({
+            session_id: id,
+            source_session_id: id,
+            user_id: user.id,
+            session_name: (sessionData as { name: string }).name,
+            was_private: (sessionData as { is_private?: boolean }).is_private ?? false,
+            timers_used: (timersData ?? []).map((t: { name: string; duration: number }) => ({
+              name: t.name,
+              duration: t.duration,
+            })),
+            participants: (allParticipants ?? []).map((p) => ({
+              username: (p as unknown as { profiles: { username: string; display_name: string } | null }).profiles?.username ?? "Unknown",
+              display_name: (p as unknown as { profiles: { username: string; display_name: string } | null }).profiles?.display_name
+                ?? (p as unknown as { profiles: { username: string } | null }).profiles?.username
+                ?? "Unknown",
+            })),
+            duration_seconds: durationSeconds,
+          });
+          cache.delByPrefix(`history:${user.id}:`);
+          cache.delByPrefix("user-hist:");
+        }
       }
     }
 
@@ -1121,7 +1142,7 @@ router.get("/:id/messages", authenticate, async (req, res) => {
 
   let query = supabase
     .from("chat_messages")
-    .select("id, content, created_at, user_id, profiles(username, emoji)")
+    .select("id, content, created_at, user_id, profiles(username, display_name, emoji)")
     .eq("session_id", id)
     .order("created_at", { ascending: false })
     .limit(limit);
@@ -1153,7 +1174,7 @@ router.post<{ id: string }>("/:id/messages", authenticate, messageLimiter, async
   const { data, error } = await supabase
     .from("chat_messages")
     .insert({ session_id: id, user_id: user.id, content: body.content.trim() })
-    .select("id, content, created_at, user_id, profiles(username, emoji)")
+    .select("id, content, created_at, user_id, profiles(username, display_name, emoji)")
     .single();
 
   if (error) { serverError(res, error); return; }

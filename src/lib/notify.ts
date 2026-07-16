@@ -18,6 +18,7 @@ interface NotifyOptions {
 
 function copyFor(opts: NotifyOptions): { category: PushCategory; payload: PushPayload } {
   const username = typeof opts.metadata?.username === "string" ? opts.metadata.username : "Someone";
+  const displayName = typeof opts.metadata?.display_name === "string" ? opts.metadata.display_name : username;
   const title = typeof opts.metadata?.title === "string" ? opts.metadata.title : "a group";
   const name = typeof opts.metadata?.name === "string" ? opts.metadata.name : "a focus session";
   const data = {
@@ -31,22 +32,22 @@ function copyFor(opts: NotifyOptions): { category: PushCategory; payload: PushPa
     case "friend_request":
       return {
         category: "friends",
-        payload: { title: "New friend request", body: `${username} wants to be your friend.`, data },
+        payload: { title: "New friend request", body: `${displayName} wants to be your friend.`, data },
       };
     case "friend_accept":
       return {
         category: "friends",
-        payload: { title: "Friend request accepted", body: `${username} accepted your friend request.`, data },
+        payload: { title: "Friend request accepted", body: `${displayName} accepted your friend request.`, data },
       };
     case "session_invite":
       return {
         category: "sessions",
-        payload: { title: "Focus session invite", body: `${username} invited you to ${name}.`, data },
+        payload: { title: "Focus session invite", body: `${displayName} invited you to ${name}.`, data },
       };
     case "group_add":
       return {
         category: "messages",
-        payload: { title: "Added to a group", body: `${username} added you to ${title}.`, data },
+        payload: { title: "Added to a group", body: `${displayName} added you to ${title}.`, data },
       };
     case "trial_ending":
       return {

@@ -27,7 +27,7 @@ type PostRow = {
   category: string;
   status: string;
   created_at: string;
-  author: { username: string | null; emoji: string | null } | null;
+  author: { username: string | null; display_name: string | null; emoji: string | null } | null;
   votes: { count: number }[];
 };
 
@@ -50,7 +50,7 @@ router.get("/", async (req, res) => {
       // reachable both directly (author via user_id) and through the
       // feedback_votes junction, which otherwise makes the embed ambiguous
       // (PostgREST PGRST201) and 500s the whole feedback board.
-      .select("*, author:profiles!feedback_posts_user_id_fkey(username, emoji), votes:feedback_votes(count)")
+      .select("*, author:profiles!feedback_posts_user_id_fkey(username, display_name, emoji), votes:feedback_votes(count)")
       .order("created_at", { ascending: false })
       .limit(200);
     if (error) { serverError(res, error); return; }

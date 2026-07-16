@@ -9,6 +9,7 @@ import { createHmac } from "crypto";
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const NOTIFY_EMAIL = process.env.WISHLIST_NOTIFY_EMAIL ?? "lucianomenezes655@gmail.com";
+const CONTACT_EMAIL = process.env.CONTACT_NOTIFY_EMAIL ?? NOTIFY_EMAIL;
 const FROM_EMAIL = process.env.WISHLIST_FROM_EMAIL ?? "onboarding@resend.dev";
 
 /** Public origin of this API — used to build unsubscribe links in emails. */
@@ -33,6 +34,7 @@ export async function sendEmail(opts: {
   to: string;
   subject: string;
   text: string;
+  replyTo?: string;
   unsubscribe?: string; // unsubscribe URL → List-Unsubscribe header
 }): Promise<boolean> {
   if (!RESEND_API_KEY) return false; // email not configured — skip silently
@@ -49,6 +51,7 @@ export async function sendEmail(opts: {
         to: [opts.to],
         subject: opts.subject,
         text: opts.text,
+        ...(opts.replyTo ? { reply_to: opts.replyTo } : {}),
         ...(opts.unsubscribe
           ? { headers: { "List-Unsubscribe": `<${opts.unsubscribe}>` } }
           : {}),
@@ -72,5 +75,33 @@ export async function sendWishlistNotification(email: string): Promise<void> {
     to: NOTIFY_EMAIL,
     subject: "New BetterPomo wishlist signup",
     text: `${email} just joined the BetterPomo wishlist.\n\nCreate their account when you're ready.`,
+  });
+}
+
+/** Deliver a landing-page contact submission to the owner. */
+export async function sendContactNotification(opts: {
+  name: string;
+  email: string;
+  topic: "feedback" | "question" | "bug" | "other";
+  message: string;
+}): Promise<boolean> {
+  const topicLabels = {
+    feedback: "Feedback",
+    question: "Question",
+    bug: "Bug report",
+    other: "Other",
+  } as const;
+
+  return sendEmail({
+    to: CONTACT_EMAIL,
+    replyTo: opts.email,
+    subject: `[BetterPomo contact] ${topicLabels[opts.topic]}`,
+    text: [
+      `Name: ${opts.name}`,
+      `Email: ${opts.email}`,
+      `Topic: ${topicLabels[opts.topic]}`,
+      "",
+      opts.message,
+    ].join("\n"),
   });
 }

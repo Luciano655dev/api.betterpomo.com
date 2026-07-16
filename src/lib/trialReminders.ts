@@ -12,7 +12,7 @@ import { notifySystem } from "./notify";
 const SWEEP_INTERVAL_MS = 60 * 60_000; // hourly
 const REMINDER_WINDOW_MS = 48 * 60 * 60_000; // notify when ≤ 2 days remain
 
-function reminderEmail(username: string, trialEndsAt: string): { subject: string; text: string } {
+function reminderEmail(displayName: string, trialEndsAt: string): { subject: string; text: string } {
   const endDate = new Date(trialEndsAt).toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
@@ -20,7 +20,7 @@ function reminderEmail(username: string, trialEndsAt: string): { subject: string
   });
   return {
     subject: "Your BetterPomo Pro trial ends in 2 days",
-    text: `Hey ${username},
+    text: `Hey ${displayName},
 
 Your 7-day Pro trial wraps up on ${endDate} — and here's the good news: nothing changes. Your full history, private sessions, custom timers, and everything else you've been using stays exactly as it is. Your Pro subscription simply starts that day.
 
@@ -52,14 +52,14 @@ async function sweep(): Promise<void> {
     .eq("trial_reminder_sent", false)
     .gte("trial_ends_at", new Date(now).toISOString())
     .lte("trial_ends_at", new Date(now + REMINDER_WINDOW_MS).toISOString())
-    .select("id, username, trial_ends_at");
+    .select("id, username, display_name, trial_ends_at");
 
   if (error) {
     console.error("Trial reminder sweep failed:", error.message);
     return;
   }
 
-  for (const row of (data ?? []) as { id: string; username: string; trial_ends_at: string }[]) {
+  for (const row of (data ?? []) as { id: string; username: string; display_name: string; trial_ends_at: string }[]) {
     await notifySystem(row.id, {
       type: "trial_ending",
       entityId: null,
@@ -69,7 +69,7 @@ async function sweep(): Promise<void> {
     const { data: authUser } = await adminDb.auth.admin.getUserById(row.id);
     const email = authUser?.user?.email;
     if (email) {
-      const { subject, text } = reminderEmail(row.username, row.trial_ends_at);
+      const { subject, text } = reminderEmail(row.display_name ?? row.username, row.trial_ends_at);
       await sendEmail({ to: email, subject, text });
     }
   }
