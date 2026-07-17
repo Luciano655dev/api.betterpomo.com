@@ -102,6 +102,7 @@ export const TTL = {
   PLAN: 60_000,            // 60s — billing columns for entitlement gates (plan:{userId})
   BILLING: 30_000,         // 30s — GET /api/billing response (billing:{userId})
   TEMPLATES: 60_000,       // 60s — session templates list (templates:{userId})
+  PUBLIC_STATUS: 60_000,    // 60s — anonymous aggregate status dashboard
 };
 
 // Default lifetime for temporary chat messages (passed to post_dm_message).

@@ -17,6 +17,7 @@ import feedbackRouter from "./routes/feedback";
 import emailRouter from "./routes/email";
 import billingRouter, { stripeWebhookHandler } from "./routes/billing";
 import templatesRouter from "./routes/templates";
+import statusRouter from "./routes/status";
 import { startEmailScheduler } from "./lib/emailScheduler";
 import { startTrialReminderSweep } from "./lib/trialReminders";
 import { redis } from "./lib/redis";
@@ -133,6 +134,7 @@ const contactLimiter = rateLimit({
 });
 
 app.use("/api/sessions", sessionsRouter);
+app.use("/api/public/status", statusRouter);
 app.use("/api/history", historyRouter);
 app.use("/api/profile", profileRouter);
 app.use("/api/users", usersRouter);
