@@ -19,6 +19,20 @@ import {
 
 const router = Router();
 
+// `last_activity_at` was added after the session API started shipping. Keep
+// mutations compatible with databases that have not applied the inactivity
+// expiry migration yet: timer/privacy writes must not fail just because the
+// optional bookkeeping column is absent. Once the migration is present, the
+// database triggers own activity tracking and this explicit write is harmless.
+let supportsLastActivityAt: boolean | null = null;
+
+function isMissingLastActivityAt(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const dbError = error as { code?: string; message?: string };
+  return dbError.code === "42703" &&
+    (dbError.message ?? "").includes("last_activity_at");
+}
+
 // Cap chat spam per user (realtime fans each message out to every participant),
 // well above a human's natural typing rate: 20 messages / 10s.
 const messageLimiter = perUserLimiter({
@@ -656,11 +670,18 @@ router.patch("/:id", authenticate, async (req, res) => {
     // Some actions (for example changing session type while idle) do not alter
     // the legacy timer columns watched by the DB trigger. Mark every successful
     // manager action explicitly so all of them reset the 24h expiry clock.
-    const { error: activityError } = await supabase
-      .from("pomodoro_sessions")
-      .update({ last_activity_at: now.toISOString() })
-      .eq("id", id);
-    if (activityError) { serverError(res, activityError); return; }
+    if (supportsLastActivityAt !== false) {
+      const { error: activityError } = await supabase
+        .from("pomodoro_sessions")
+        .update({ last_activity_at: now.toISOString() })
+        .eq("id", id);
+      if (activityError) {
+        if (isMissingLastActivityAt(activityError)) supportsLastActivityAt = false;
+        else { serverError(res, activityError); return; }
+      } else {
+        supportsLastActivityAt = true;
+      }
+    }
 
     const { data: updated } = await supabase.from("pomodoro_sessions").select("*").eq("id", id).single();
     res.json({ data: { session: updated } });
@@ -678,7 +699,9 @@ router.patch("/:id", authenticate, async (req, res) => {
     patch.password_hash = body.password ? await bcrypt.hash(body.password, 10) : null;
   }
   if (!Object.keys(patch).length) { res.status(400).json({ error: "Nothing to update" }); return; }
-  patch.last_activity_at = new Date().toISOString();
+  if (supportsLastActivityAt !== false) {
+    patch.last_activity_at = new Date().toISOString();
+  }
 
   // Turning privacy ON (or setting a password) is a Pro feature; turning it
   // off or clearing a password is always allowed.
@@ -687,8 +710,19 @@ router.patch("/:id", authenticate, async (req, res) => {
     if (!ent.privateSessions) { upgradeRequired(res, "private_sessions"); return; }
   }
 
-  const { data: updated, error } = await supabase
+  let { data: updated, error } = await supabase
     .from("pomodoro_sessions").update(patch).eq("id", id).select().single();
+  if (error && isMissingLastActivityAt(error)) {
+    // Retry the actual metadata change without the optional activity column.
+    // The first query is rejected as a whole by PostgREST, so this cannot
+    // double-apply the privacy/password update.
+    supportsLastActivityAt = false;
+    delete patch.last_activity_at;
+    ({ data: updated, error } = await supabase
+      .from("pomodoro_sessions").update(patch).eq("id", id).select().single());
+  } else if (!error && "last_activity_at" in patch) {
+    supportsLastActivityAt = true;
+  }
   if (error) { serverError(res, error); return; }
   // Never expose password_hash
   const { password_hash: _ph2, ...safeUpdated } = (updated ?? {}) as Record<string, unknown> & { password_hash?: unknown };

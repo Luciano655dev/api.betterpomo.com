@@ -42,6 +42,7 @@ async function pushNewMessage(
   conversationId: string,
   messageId: string,
   senderId: string,
+  content: string,
 ): Promise<void> {
   try {
     const [{ data: members, error: membersError }, { data: conversation }, actor] = await Promise.all([
@@ -52,19 +53,23 @@ async function pushNewMessage(
     if (membersError) throw membersError;
     const recipients = (members ?? []).map((member) => member.user_id).filter((id) => id !== senderId);
     const groupTitle = conversation?.title?.trim() || "your group";
+    const preview = content.replace(/\s+/g, " ").trim().slice(0, 160);
     await Promise.all(recipients.map((recipientId) => queuePush(
       recipientId,
       "messages",
       `chat_message:${messageId}`,
       {
-        title: actor.display_name,
-        body: conversation?.is_group ? `New message in ${groupTitle}` : "Sent you a message",
+        title: conversation?.is_group
+          ? `${actor.emoji} ${actor.display_name} · ${groupTitle}`
+          : `${actor.emoji} ${actor.display_name}`,
+        body: `💬 ${preview}`,
         data: {
           type: "chat_message",
           conversation_id: conversationId,
           sender_id: senderId,
           username: actor.username,
           display_name: actor.display_name,
+          emoji: actor.emoji,
         },
         collapseId: `chat:${conversationId}`,
       },
@@ -257,7 +262,7 @@ router.post<{ id: string }>("/conversations/:id/messages", dmMessageLimiter, asy
   if (error) { res.status(400).json({ error: error.message }); return; }
 
   await invalidateConversation(supabase, id);
-  if (data?.id) await pushNewMessage(supabase, id, String(data.id), user.id);
+  if (data?.id) await pushNewMessage(supabase, id, String(data.id), user.id, body.content.trim());
   res.status(201).json({ data });
 });
 
