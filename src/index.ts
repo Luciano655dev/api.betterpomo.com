@@ -172,6 +172,15 @@ app.use("/api/auth/register", authEmailLimiter);
 app.use("/api/auth/forgot-password", authEmailLimiter);
 app.use("/api/auth/resend-verification", authEmailLimiter);
 app.use("/api/auth/verify-email", authVerificationLimiter);
+const authLoginLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 60,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Too many sign-in attempts. Please try again later." },
+  ...(redis ? { store: makeRedisStore("rl:auth-login:") } : {}),
+});
+app.use("/api/auth/login", authLoginLimiter);
 app.use("/api/auth", authRouter);
 
 // 404 for unknown API routes.

@@ -20,6 +20,30 @@ function publicSession(session: { access_token: string; refresh_token: string } 
  *  reset form. Must be listed in Supabase's allowed redirect URLs. */
 const WEB_URL = (process.env.WEB_URL ?? "https://app.betterpomo.com").replace(/\/$/, "");
 
+async function resolveLoginEmail(identifier: string): Promise<string | null> {
+  const normalized = identifier.trim().toLowerCase();
+  if (EMAIL_RE.test(normalized) && normalized.length <= 254) return normalized;
+  if (!USERNAME_RE.test(normalized)) return null;
+
+  const { data: profile, error: profileError } = await adminDb
+    .from("profiles")
+    .select("id")
+    .ilike("username", escapeLike(normalized))
+    .limit(1)
+    .maybeSingle();
+  if (profileError) throw profileError;
+  if (!profile) return null;
+
+  const { data, error } = await adminDb.auth.admin.getUserById(profile.id);
+  if (error) throw error;
+  return data.user?.email?.trim().toLowerCase() ?? null;
+}
+
+function isEmailNotConfirmed(error: { code?: string; message?: string } | null): boolean {
+  return error?.code === "email_not_confirmed"
+    || error?.message?.toLowerCase().includes("email not confirmed") === true;
+}
+
 /**
  * POST /api/auth/register — PUBLIC (no authenticate middleware).
  * Body: { email, password, username }
@@ -76,7 +100,76 @@ router.post("/register", async (req, res) => {
     options: { data: { username } },
   });
   if (error) {
+    console.error("auth.register signup failed:", error.message);
     res.status(400).json({ error: error.message });
+    return;
+  }
+
+  // Supabase deliberately returns an obfuscated successful response for a
+  // repeated signup. In that case no new confirmation message is guaranteed;
+  // explicitly request one so an abandoned confirmation screen is recoverable.
+  // A brand-new signup has an identity and already triggered its first email.
+  if (!data.session && data.user && (data.user.identities?.length ?? 0) === 0) {
+    const { error: resendError } = await anon.auth.resend({ type: "signup", email });
+    if (resendError) {
+      console.error("auth.register repeated-signup resend failed:", resendError.message);
+    }
+  }
+
+  res.json({
+    data: {
+      user: data.user ? { id: data.user.id, email: data.user.email } : null,
+      session: publicSession(data.session),
+    },
+  });
+});
+
+/**
+ * POST /api/auth/login — PUBLIC.
+ * Body: { identifier, password }
+ *
+ * Accepts either an email address or a BetterPomo username. Username-to-email
+ * resolution stays on the trusted server because auth.users is never exposed
+ * through the public profiles API. If the password is correct but the email is
+ * unconfirmed, a fresh code is requested and clients can switch directly to
+ * their confirmation screen.
+ */
+router.post("/login", async (req, res) => {
+  const identifier = typeof req.body?.identifier === "string"
+    ? req.body.identifier.trim().toLowerCase()
+    : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!identifier || !password) {
+    res.status(400).json({ error: "Username/email and password are required" });
+    return;
+  }
+
+  let email: string | null;
+  try {
+    email = await resolveLoginEmail(identifier);
+  } catch (lookupError) {
+    serverError(res, lookupError, "auth.login lookup");
+    return;
+  }
+  if (!email) {
+    res.status(400).json({ error: "Invalid username/email or password", code: "invalid_credentials" });
+    return;
+  }
+
+  const anon = createAnonClient();
+  const { data, error } = await anon.auth.signInWithPassword({ email, password });
+  if (error) {
+    if (isEmailNotConfirmed(error)) {
+      const { error: resendError } = await anon.auth.resend({ type: "signup", email });
+      if (resendError) console.error("auth.login confirmation resend failed:", resendError.message);
+      res.status(403).json({
+        error: "Confirm your email to sign in.",
+        code: "email_not_confirmed",
+        verification_sent: !resendError,
+      });
+      return;
+    }
+    res.status(400).json({ error: "Invalid username/email or password", code: "invalid_credentials" });
     return;
   }
 
@@ -97,17 +190,29 @@ router.post("/register", async (req, res) => {
  * asking for their password again.
  */
 router.post("/verify-email", async (req, res) => {
-  const rawEmail = req.body?.email;
+  const rawIdentifier = req.body?.identifier ?? req.body?.email;
   const rawToken = req.body?.token;
-  const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
+  const identifier = typeof rawIdentifier === "string" ? rawIdentifier.trim().toLowerCase() : "";
   const token = typeof rawToken === "string" ? rawToken.trim() : "";
 
-  if (!email || email.length > 254 || !EMAIL_RE.test(email)) {
-    res.status(400).json({ error: "Enter a valid email address" });
+  if (!identifier) {
+    res.status(400).json({ error: "Enter a valid email address or username" });
     return;
   }
   if (!EMAIL_CODE_RE.test(token)) {
     res.status(400).json({ error: "Enter the 6-digit code from your email" });
+    return;
+  }
+
+  let email: string | null;
+  try {
+    email = await resolveLoginEmail(identifier);
+  } catch (lookupError) {
+    serverError(res, lookupError, "auth.verify-email lookup");
+    return;
+  }
+  if (!email) {
+    res.status(400).json({ error: "That code is invalid or has expired. Request a new code and try again." });
     return;
   }
 
@@ -138,16 +243,28 @@ router.post("/verify-email", async (req, res) => {
  * addition to the API's per-IP email rate limit.
  */
 router.post("/resend-verification", async (req, res) => {
-  const rawEmail = req.body?.email;
-  const email = typeof rawEmail === "string" ? rawEmail.trim().toLowerCase() : "";
-  if (!email || email.length > 254 || !EMAIL_RE.test(email)) {
-    res.status(400).json({ error: "Enter a valid email address" });
+  const rawIdentifier = req.body?.identifier ?? req.body?.email;
+  const identifier = typeof rawIdentifier === "string" ? rawIdentifier.trim().toLowerCase() : "";
+  if (!identifier) {
+    res.status(400).json({ error: "Enter a valid email address or username" });
     return;
   }
+
+  let email: string | null;
+  try {
+    email = await resolveLoginEmail(identifier);
+  } catch (lookupError) {
+    serverError(res, lookupError, "auth.resend-verification lookup");
+    return;
+  }
+  // Keep the public response non-enumerating. Unknown identifiers receive the
+  // same success shape, but no provider request is made.
+  if (!email) { res.json({ data: { ok: true } }); return; }
 
   const anon = createAnonClient();
   const { error } = await anon.auth.resend({ type: "signup", email });
   if (error) {
+    console.error("auth.resend-verification failed:", error.message);
     res.status(400).json({ error: error.message });
     return;
   }
