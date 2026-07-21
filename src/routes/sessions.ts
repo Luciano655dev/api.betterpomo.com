@@ -339,7 +339,11 @@ router.post("/join", authenticate, async (req, res) => {
       const supplied = typeof body.password === "string" ? body.password : "";
       const valid = await bcrypt.compare(supplied, hash);
       if (!valid) {
-        res.status(401).json({ error: "Incorrect password" }); return;
+        // The caller is authenticated but is not authorized to enter this
+        // protected session. A 401 makes browser clients assume their login
+        // token expired and redirect to /login; 403 correctly preserves the
+        // password gate.
+        res.status(403).json({ error: "Incorrect password" }); return;
       }
     }
   }
@@ -951,12 +955,16 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
   const { user, supabase } = req;
   const { id } = req.params;
   const { left_at, save_history } = req.body ?? {};
+  let savedHistory: Record<string, unknown> | null = null;
 
   if (left_at === undefined) {
     res.status(400).json({ error: "left_at is required" }); return;
   }
   if (save_history !== undefined && typeof save_history !== "boolean") {
     res.status(400).json({ error: "save_history must be a boolean" }); return;
+  }
+  if (left_at !== null && typeof left_at !== "string") {
+    res.status(400).json({ error: "left_at must be an ISO timestamp or null" }); return;
   }
 
   // Capture role before leaving. A user may only change their own presence in a
@@ -971,7 +979,13 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
 
   // Clearing left_at is the client's "I'm here" assert (fired on mount and when
   // the app returns to the foreground) — refresh the inactivity heartbeat too.
-  const membershipPatch: Record<string, unknown> = { left_at: left_at ?? null };
+  // Client clocks are not authoritative for analytics. The request's timestamp
+  // is only an intent signal (null = active, non-null = leave); attendance and
+  // focus segments always close on the API's clock.
+  const membershipChangedAt = new Date();
+  const membershipPatch: Record<string, unknown> = {
+    left_at: left_at === null ? null : membershipChangedAt.toISOString(),
+  };
   if (left_at === null) membershipPatch.last_seen_at = new Date().toISOString();
 
   const { error } = await supabase
@@ -1011,7 +1025,7 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
           return;
         }
         const durationSeconds = metrics?.totalSeconds ?? Math.floor(
-          (Date.now() - new Date((myParticipant as { joined_at: string }).joined_at).getTime()) / 1000
+          (membershipChangedAt.getTime() - new Date((myParticipant as { joined_at: string }).joined_at).getTime()) / 1000
         );
         const focusSeconds = metrics?.focusSeconds;
         const { data: existing } = await supabase
@@ -1039,20 +1053,33 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
           })),
           duration_seconds: durationSeconds,
           ...(focusSeconds !== undefined ? { focus_seconds: focusSeconds } : {}),
-          completed_at: new Date().toISOString(),
+          completed_at: membershipChangedAt.toISOString(),
         };
 
         if (existing) {
-          await supabase
+          const { data: updatedHistory, error: updateHistoryError } = await supabase
             .from("pomodoro_history")
             .update(historySnapshot)
             .eq("id", existing.id)
-            .eq("user_id", user.id);
+            .eq("user_id", user.id)
+            .select()
+            .single();
+          if (!updateHistoryError && updatedHistory) {
+            savedHistory = updatedHistory as Record<string, unknown>;
+          }
         } else {
-          await supabase.from("pomodoro_history").insert(historySnapshot);
+          const { data: insertedHistory, error: insertHistoryError } = await supabase
+            .from("pomodoro_history")
+            .insert(historySnapshot)
+            .select()
+            .single();
+          if (!insertHistoryError && insertedHistory) {
+            savedHistory = insertedHistory as Record<string, unknown>;
+          }
         }
         cache.delByPrefix(`history:${user.id}:`);
         cache.del(`history-summary:${user.id}`);
+        cache.del(`history-analytics:${user.id}`);
         cache.delByPrefix("user-hist:");
       }
     }
@@ -1085,7 +1112,10 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
     }
   }
 
-  res.json({ data: null });
+  // Returning the final server-authored row lets the recap use the exact same
+  // total/focus values that were persisted, rather than the client's pre-leave
+  // approximation from a few moments earlier.
+  res.json({ data: savedHistory });
 });
 
 /** PATCH /api/sessions/:id/participants/:participantId

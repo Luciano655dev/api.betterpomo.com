@@ -421,6 +421,7 @@ router.delete("/", authenticate, async (req, res) => {
   cache.del(`billing:${user.id}`);
   cache.del(`templates:${user.id}`);
   cache.delByPrefix(`history:${user.id}:`);
+  cache.del(`history-analytics:${user.id}`);
   cache.delByPrefix(`friends:${user.id}:`);
   cache.del(`friend-count:${user.id}`);
   cache.del(`friend-reqs:${user.id}`);

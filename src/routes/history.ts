@@ -92,6 +92,41 @@ router.get("/summary", authenticate, async (req, res) => {
   res.json({ data });
 });
 
+/** GET /api/history/analytics — the lightweight history dataset used by the
+ * dashboard's week/month/year circles. The regular history endpoint is paged
+ * for the timeline; analytics must not silently stop at its first 50 rows. */
+router.get("/analytics", authenticate, async (req, res) => {
+  const { user, supabase } = req;
+  const cacheKey = `history-analytics:${user.id}`;
+  const hit = cache.get(cacheKey);
+  if (hit) { res.json({ data: hit }); return; }
+
+  const ent = await getUserEntitlements(user.id);
+  const cutoff = historyCutoffISO(ent.historyDays);
+  const pageSize = 1_000;
+  const maxRows = 10_000;
+  const rows: unknown[] = [];
+
+  for (let from = 0; from < maxRows; from += pageSize) {
+    let query = supabase
+      .from("pomodoro_history")
+      .select("session_name, timers_used, duration_seconds, focus_seconds, completed_at")
+      .eq("user_id", user.id);
+    if (cutoff) query = query.gte("completed_at", cutoff);
+
+    const { data, error } = await query
+      .order("completed_at", { ascending: false })
+      .range(from, from + pageSize - 1);
+    if (error) { serverError(res, error); return; }
+
+    rows.push(...(data ?? []));
+    if ((data?.length ?? 0) < pageSize) break;
+  }
+
+  cache.set(cacheKey, rows, TTL.HISTORY);
+  res.json({ data: rows });
+});
+
 /** GET /api/history/session/:sessionId — the caller's archived copy of a
  * session. source_session_id survives the session row's ON DELETE SET NULL and
  * lets clients recover the server-created recap after inactivity expiry. */
@@ -278,6 +313,7 @@ router.post("/", authenticate, async (req, res) => {
       if (updateExistingError) { serverError(res, updateExistingError); return; }
       cache.delByPrefix(`history:${user.id}:`);
       cache.del(`history-summary:${user.id}`);
+      cache.del(`history-analytics:${user.id}`);
       cache.delByPrefix("user-hist:");
       res.json({ data: updatedExisting });
       return;
@@ -343,6 +379,7 @@ router.post("/", authenticate, async (req, res) => {
 
   cache.delByPrefix(`history:${user.id}:`);
   cache.del(`history-summary:${user.id}`);
+  cache.del(`history-analytics:${user.id}`);
   cache.delByPrefix("user-hist:");
 
   res.status(201).json({ data });
@@ -389,6 +426,7 @@ router.patch("/:id", authenticate, async (req, res) => {
 
   cache.delByPrefix(`history:${user.id}:`);
   cache.del(`history-summary:${user.id}`);
+  cache.del(`history-analytics:${user.id}`);
   cache.delByPrefix("user-hist:");
 
   res.json({ data });
@@ -409,6 +447,7 @@ router.delete("/:id", authenticate, async (req, res) => {
 
   cache.delByPrefix(`history:${user.id}:`);
   cache.del(`history-summary:${user.id}`);
+  cache.del(`history-analytics:${user.id}`);
   cache.delByPrefix("user-hist:");
 
   res.json({ data: null });

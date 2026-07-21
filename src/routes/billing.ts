@@ -71,6 +71,7 @@ async function applyPlanChange(userId: string, patch: Partial<BillingRow>): Prom
   cache.del(`billing:${userId}`);
   cache.delByPrefix(`history:${userId}:`);
   cache.del(`history-summary:${userId}`);
+  cache.del(`history-analytics:${userId}`);
   cache.delByPrefix("user:");
   cache.delByPrefix("user-hist:");
 }
