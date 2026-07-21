@@ -1,10 +1,11 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
+import { randomUUID } from "crypto";
 import { serverError } from "../lib/http";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { authenticate } from "../middleware/auth";
 import { perUserLimiter } from "../middleware/rateLimit";
-import { generateSessionCode, clampInt, escapeLike } from "../lib/utils";
+import { generateSessionCode, escapeLike } from "../lib/utils";
 import { cache, TTL } from "../lib/cache";
 import { createAuthClient } from "../lib/supabase";
 import { getSessionTimeMetrics } from "../lib/sessionTime";
@@ -1184,33 +1185,19 @@ router.post("/:id/participants/:userId/kick", authenticate, async (req, res) => 
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 /** GET /api/sessions/:id/messages
- *  Query params: limit (default 50), before (ISO timestamp) */
+ *  Session chat is ephemeral. This compatibility endpoint intentionally
+ *  returns no history so older clients do not see previously persisted rows. */
 router.get("/:id/messages", authenticate, async (req, res) => {
   const { user, supabase } = req;
   const { id } = req.params;
 
   if (!(await requireParticipant(supabase, String(id), user.id, res))) return;
-
-  const limit = clampInt(req.query.limit, { min: 1, max: 200, fallback: 50 });
-  const before = req.query.before as string | undefined;
-
-  let query = supabase
-    .from("chat_messages")
-    .select("id, content, created_at, user_id, profiles(username, display_name, emoji)")
-    .eq("session_id", id)
-    .order("created_at", { ascending: false })
-    .limit(limit);
-
-  if (before) query = query.lt("created_at", before);
-
-  const { data, error } = await query;
-  if (error) { serverError(res, error); return; }
-
-  res.json({ data: (data ?? []).reverse() });
+  res.json({ data: [] });
 });
 
 /** POST /api/sessions/:id/messages
- *  Body: { content: string } */
+ *  Validate and relay an ephemeral message over Supabase Realtime Broadcast.
+ *  No chat row is inserted; only clients already subscribed receive it. */
 router.post<{ id: string }>("/:id/messages", authenticate, messageLimiter, async (req, res) => {
   const { user, supabase } = req;
   const { id } = req.params;
@@ -1223,16 +1210,44 @@ router.post<{ id: string }>("/:id/messages", authenticate, messageLimiter, async
     res.status(400).json({ error: "Message cannot exceed 500 characters" }); return;
   }
 
-  if (!(await requireParticipant(supabase, String(id), user.id, res))) return;
+  // One query proves active membership and resolves the authoritative sender
+  // profile. Receivers never have to trust identity fields supplied by clients.
+  const { data: membership, error: membershipError } = await supabase
+    .from("session_participants")
+    .select("profiles(username, display_name, emoji)")
+    .eq("session_id", id)
+    .eq("user_id", user.id)
+    .is("left_at", null)
+    .maybeSingle();
 
-  const { data, error } = await supabase
-    .from("chat_messages")
-    .insert({ session_id: id, user_id: user.id, content: body.content.trim() })
-    .select("id, content, created_at, user_id, profiles(username, display_name, emoji)")
-    .single();
+  if (membershipError) { serverError(res, membershipError); return; }
+  if (!membership) { res.status(404).json({ error: "Session not found" }); return; }
 
-  if (error) { serverError(res, error); return; }
-  res.status(201).json({ data });
+  const profile = (membership as unknown as {
+    profiles: { username: string; display_name: string; emoji: string } | null;
+  }).profiles;
+  const fallbackName = user.email?.split("@")[0] ?? "User";
+  const message = {
+    id: randomUUID(),
+    content: body.content.trim(),
+    created_at: new Date().toISOString(),
+    user_id: user.id,
+    profiles: profile ?? { username: fallbackName, display_name: fallbackName, emoji: "🍅" },
+  };
+
+  const channel = supabase.channel(`session:${id}:chat`, { config: { private: true } });
+  try {
+    const delivery = await channel.httpSend("message", message);
+    if (!delivery.success) {
+      res.status(503).json({ error: "Message could not be delivered" }); return;
+    }
+  } catch (error) {
+    serverError(res, error); return;
+  } finally {
+    void supabase.removeChannel(channel);
+  }
+
+  res.status(201).json({ data: message });
 });
 
 /** POST /api/sessions/:id/accept-invite

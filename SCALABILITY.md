@@ -111,6 +111,6 @@ created_at desc)`, and a **unique** `pomodoro_history(session_id, user_id)`
   Realtime, not this API. Keep the number of tables in the `supabase_realtime`
   publication and per-session channel counts in mind; that's the more likely
   ceiling than the Express layer.
-- **Chat history growth** is bounded: session `chat_messages` cascade-delete when
-  the session is deleted (last-leave or sweep), and DM `dm_messages` have a 24h
-  TTL cleanup. No unbounded table growth there.
+- **Session chat has no history growth:** messages use private Realtime Broadcast
+  and only exist in connected clients' memory. DM `dm_messages` retain their 24h
+  TTL cleanup.

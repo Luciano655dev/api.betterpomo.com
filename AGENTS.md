@@ -143,7 +143,7 @@ res.status(400).json({ error: "Bad request" });  // error
 2. If it's a new resource, create a new router file and register it in `src/index.ts`.
 3. **Specific paths before generic ones** — `/by-code/:code` must come before `/:id` or Express will capture it wrong.
 4. Add cache logic per the table above; mutations must invalidate.
-5. See root `CLAUDE.md` for the full cache invalidation rules per mutation type.
+5. See root `PROJECT_GUIDE.md` for the full cache invalidation rules per mutation type.
 
 ## Supabase RPCs used
 
@@ -168,7 +168,7 @@ res.status(400).json({ error: "Bad request" });  // error
 | GET /:id/participants | List participants |
 | PATCH /:id/participants/me | Leave / re-join (set left_at); deletes session when last person leaves and saves history as safety net |
 | PATCH /:id/participants/:pid | Kick or change role |
-| GET /:id/messages | Chat history |
-| POST /:id/messages | Post chat message |
+| GET /:id/messages | Compatibility endpoint; always returns empty session chat history |
+| POST /:id/messages | Validate and privately broadcast an ephemeral session chat message |
 | POST /:id/laps | Record stopwatch lap |
 | GET /:id/laps | Fetch laps |
