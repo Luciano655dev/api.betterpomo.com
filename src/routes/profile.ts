@@ -407,7 +407,40 @@ router.delete("/", authenticate, async (req, res) => {
     }
   }
 
-  // 2. Delete the auth user (cascades to profile + dependent rows via FK).
+  // 2. Transfer governed groups as well. A group's creator FK cascades on
+  // profile deletion, so ownership must move before the auth row disappears.
+  const { data: ownedGroups, error: ownedGroupsError } = await adminDb
+    .from("conversations")
+    .select("id")
+    .eq("created_by", user.id)
+    .eq("is_group", true);
+  if (ownedGroupsError) { serverError(res, ownedGroupsError); return; }
+
+  for (const group of (ownedGroups ?? []) as { id: string }[]) {
+    const { data: others, error: membersError } = await adminDb
+      .from("conversation_members")
+      .select("user_id, role, joined_at")
+      .eq("conversation_id", group.id)
+      .neq("user_id", user.id)
+      .order("joined_at", { ascending: true });
+    if (membersError) { serverError(res, membersError); return; }
+
+    if (!others?.length) {
+      const { error: deleteGroupError } = await adminDb.from("conversations").delete().eq("id", group.id);
+      if (deleteGroupError) { serverError(res, deleteGroupError); return; }
+      continue;
+    }
+
+    const next = (others.find((member) => member.role === "admin") ?? others[0]) as { user_id: string };
+    const { error: transferError } = await adminDb.rpc("transfer_group_ownership", {
+      p_actor: user.id,
+      p_conversation_id: group.id,
+      p_new_owner: next.user_id,
+    });
+    if (transferError) { serverError(res, transferError); return; }
+  }
+
+  // 3. Delete the auth user (cascades to profile + dependent rows via FK).
   const { error } = await adminDb.auth.admin.deleteUser(user.id);
   if (error) {
     console.error("Account deletion failed:", error);
@@ -415,7 +448,7 @@ router.delete("/", authenticate, async (req, res) => {
     return;
   }
 
-  // 3. Drop every cache entry that referenced this user.
+  // 4. Drop every cache entry that referenced this user.
   cache.del(`profile:${user.id}`);
   cache.del(`plan:${user.id}`);
   cache.del(`billing:${user.id}`);

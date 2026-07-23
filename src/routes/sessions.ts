@@ -60,6 +60,41 @@ async function getActiveSessionId(supabase: SupabaseClient, userId: string): Pro
 const ALREADY_IN_SESSION =
   "You're already in a session. Leave it before starting or joining another.";
 
+/** Broadcast a local-only chat divider when someone genuinely joins/rejoins.
+ *  This deliberately uses Realtime Broadcast instead of a table row: session
+ *  chat history must never be persisted or replayed to later participants. */
+async function broadcastSessionJoinNotice(
+  supabase: SupabaseClient,
+  sessionId: string,
+  userId: string,
+): Promise<void> {
+  const { data: profile } = await supabase
+    .from("profiles")
+    .select("username, display_name, emoji")
+    .eq("id", userId)
+    .maybeSingle();
+  const username = profile?.username ?? "someone";
+  const notice = {
+    id: randomUUID(),
+    type: "participant_joined",
+    content: `@${username} joined the session`,
+    created_at: new Date().toISOString(),
+    user_id: userId,
+    profiles: profile ?? { username, display_name: username, emoji: "🍅" },
+  };
+
+  const channel = supabase.channel(`session:${sessionId}:chat`, { config: { private: true } });
+  try {
+    const delivery = await channel.httpSend("notice", notice);
+    if (!delivery.success) console.error("session join notice could not be delivered", { sessionId, userId });
+  } catch (error) {
+    // A notification must never prevent the participant from entering.
+    console.error("session join notice failed", error);
+  } finally {
+    void supabase.removeChannel(channel);
+  }
+}
+
 // ── Authorization guards ────────────────────────────────────────────────────────
 // req.supabase is the service-role client (RLS bypassed), so every session route
 // must prove the caller belongs to the session it names. Without these checks any
@@ -400,6 +435,9 @@ router.post("/join", authenticate, async (req, res) => {
       .maybeSingle();
     participant = fetched ?? { role: "member", joined_at: new Date().toISOString() };
   }
+  if (!existingParticipant || existingParticipant.left_at !== null) {
+    await broadcastSessionJoinNotice(supabase, session.id as string, user.id);
+  }
   // Strip password_hash from session before returning
   const { password_hash: _ph, ...safeSession } = session as Record<string, unknown> & { password_hash?: unknown };
   void _ph;
@@ -639,13 +677,12 @@ router.patch("/:id", authenticate, async (req, res) => {
       }
 
       case "sw_reset": {
-        // Stopwatch-only: reset timer to zero and delete all laps
+        // Stopwatch-only: reset elapsed time without touching recorded laps.
         const { error: resetErr } = await supabase
           .from("pomodoro_sessions")
           .update({ timer_state: "idle", timer_started_at: null, paused_elapsed_seconds: 0 })
           .eq("id", id);
         if (resetErr) { serverError(res, resetErr); return; }
-        await supabase.from("stopwatch_laps").delete().eq("session_id", id);
         break;
       }
 
@@ -904,6 +941,16 @@ router.patch("/:id/laps/:lapId", authenticate, async (req, res) => {
   res.json({ data });
 });
 
+/** DELETE /api/sessions/:id/laps — clear every recorded lap, leaving the stopwatch untouched. */
+router.delete("/:id/laps", authenticate, async (req, res) => {
+  const { user, supabase } = req;
+  const { id } = req.params;
+  if (!(await requireManager(supabase, String(id), user.id, res))) return;
+  const { error } = await supabase.from("stopwatch_laps").delete().eq("session_id", id);
+  if (error) { serverError(res, error); return; }
+  res.json({ data: null });
+});
+
 /** DELETE /api/sessions/:id/laps/:lapId */
 router.delete("/:id/laps/:lapId", authenticate, async (req, res) => {
   const { user, supabase } = req;
@@ -971,7 +1018,7 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
   // session they actually belong to — no row means they were never a participant.
   const { data: me } = await supabase
     .from("session_participants")
-    .select("role")
+    .select("role, left_at")
     .eq("session_id", id)
     .eq("user_id", user.id)
     .maybeSingle();
@@ -995,6 +1042,10 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
     .eq("user_id", user.id);
 
   if (error) { serverError(res, error); return; }
+
+  if (left_at === null && me.left_at !== null) {
+    await broadcastSessionJoinNotice(supabase, String(id), user.id);
+  }
 
   if (left_at !== null) {
     // Persist the leaving user's history on EVERY leave (idempotent), not just
@@ -1352,6 +1403,9 @@ router.post("/:id/accept-invite", authenticate, async (req, res) => {
       .eq("user_id", user.id)
       .maybeSingle();
     participant = fetched ?? { role: "member", joined_at: new Date().toISOString() };
+  }
+  if (!existingParticipant || existingParticipant.left_at !== null) {
+    await broadcastSessionJoinNotice(supabase, String(id), user.id);
   }
   const { password_hash: _ph, ...safeSession } = sessionRow as Record<string, unknown> & { password_hash?: unknown };
   void _ph;

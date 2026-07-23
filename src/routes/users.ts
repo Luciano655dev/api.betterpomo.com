@@ -221,17 +221,29 @@ router.get("/:username/active-session", async (req, res) => {
   const profile = resolved as { id: string; is_private: boolean } | null;
   if (!profile) { res.status(404).json({ error: "User not found" }); return; }
 
-  if (profile.is_private && profile.id !== req.user.id) {
-    res.json({ data: null });
-    return;
-  }
-
-  const { data, error } = await req.supabase
-    .rpc("get_user_active_session", { p_user_id: profile.id });
-
+  // Generic session presence is visible to every authenticated user, including
+  // non-friends and private profiles. Identity/join details remain protected by
+  // both profile and session privacy.
+  const { data: participant, error } = await req.supabase
+    .from("session_participants")
+    .select("pomodoro_sessions!inner(name, status, is_private)")
+    .eq("user_id", profile.id)
+    .is("left_at", null)
+    .in("pomodoro_sessions.status", ["waiting", "active"])
+    .limit(1)
+    .maybeSingle();
   if (error) { serverError(res, error); return; }
-  const sessionName = data?.[0]?.session_name ?? null;
-  res.json({ data: sessionName ? { session_name: sessionName } : null });
+  if (!participant) { res.json({ data: { in_session: false, session_name: null } }); return; }
+  const session = (participant as unknown as {
+    pomodoro_sessions: { name: string; is_private: boolean } | null;
+  }).pomodoro_sessions;
+  const mayIdentify = profile.id === req.user.id || (!profile.is_private && !session?.is_private);
+  res.json({
+    data: {
+      in_session: true,
+      session_name: mayIdentify ? session?.name ?? null : null,
+    },
+  });
 });
 
 export default router;

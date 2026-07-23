@@ -82,6 +82,57 @@ export async function queuePush(
   if (error) throw error;
 }
 
+/**
+ * Queue a push that can absorb later events for the same recipient/context.
+ * The database function serializes concurrent writers, delays delivery until
+ * the burst goes quiet, and still releases a summary after the maximum delay.
+ */
+export async function queueCoalescedPush(
+  recipientId: string,
+  category: PushCategory,
+  eventKey: string,
+  coalesceKey: string,
+  payload: PushPayload,
+  aggregateTitle: string,
+  options: { delaySeconds?: number; maxDelaySeconds?: number } = {},
+): Promise<void> {
+  const [{ data: preferences, error: prefError }, { data: devices, error: deviceError }] = await Promise.all([
+    adminDb.from("notification_preferences").select(category).eq("user_id", recipientId).maybeSingle(),
+    adminDb.from("push_devices").select("id").eq("user_id", recipientId).is("disabled_at", null),
+  ]);
+  if (prefError) throw prefError;
+  if (deviceError) throw deviceError;
+  if (preferences && (preferences as Record<PushCategory, boolean>)[category] === false) return;
+  if (!devices?.length) return;
+
+  const delaySeconds = options.delaySeconds ?? 20;
+  const maxDelaySeconds = options.maxDelaySeconds ?? 90;
+  await Promise.all(devices.map(async (device) => {
+    const { error } = await adminDb.rpc("queue_coalesced_push_delivery_job", {
+      p_user_id: recipientId,
+      p_push_device_id: device.id,
+      p_event_key: eventKey,
+      p_coalesce_key: coalesceKey,
+      p_payload: payload,
+      p_aggregate_title: aggregateTitle,
+      p_delay_seconds: delaySeconds,
+      p_max_delay_seconds: maxDelaySeconds,
+    });
+    if (error) throw error;
+  }));
+}
+
+/** Remove an alert that is no longer useful because the user read its context. */
+export async function cancelCoalescedPush(recipientId: string, coalesceKey: string): Promise<void> {
+  const { error } = await adminDb
+    .from("push_delivery_jobs")
+    .delete()
+    .eq("user_id", recipientId)
+    .eq("coalesce_key", coalesceKey)
+    .eq("status", "queued");
+  if (error) throw error;
+}
+
 async function disableDevice(deviceId: string, reason: string): Promise<void> {
   await adminDb
     .from("push_devices")

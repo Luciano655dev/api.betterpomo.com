@@ -7,6 +7,7 @@ export type NotificationType =
   | "friend_accept"
   | "session_invite"
   | "group_add"
+  | "group_invite"
   | "trial_ending";
 
 interface NotifyOptions {
@@ -49,6 +50,11 @@ function copyFor(opts: NotifyOptions): { category: PushCategory; payload: PushPa
       return {
         category: "messages",
         payload: { title: "💬 You're in!", body: `${actorEmoji} ${displayName} added you to ${title}.`, data },
+      };
+    case "group_invite":
+      return {
+        category: "messages",
+        payload: { title: "👥 Group invitation", body: `${actorEmoji} ${displayName} invited you to ${title}.`, data },
       };
     case "trial_ending":
       return {
