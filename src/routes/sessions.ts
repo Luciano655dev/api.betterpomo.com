@@ -252,6 +252,9 @@ router.post("/", authenticate, async (req, res) => {
   const passwordHash = rawPassword ? await bcrypt.hash(rawPassword, 10) : null;
 
   const sessionType = body.session_type === "stopwatch" ? "stopwatch" : "pomodoro";
+  const starterFocusMinutes = [15, 25, 35, 55].includes(body.starter_focus_minutes)
+    ? Number(body.starter_focus_minutes)
+    : null;
 
   // Optional Pro feature: create from a saved template (replaces the default
   // timers with the template's set). Validate before creating the session so
@@ -309,6 +312,25 @@ router.post("/", authenticate, async (req, res) => {
       await supabase.from("timers").insert(timerRows);
       cache.del(`timers:${data}`);
     }
+  } else if (sessionType === "pomodoro" && starterFocusMinutes !== null) {
+    const { data: defaultTimers, error: timerError } = await supabase
+      .from("timers")
+      .select("id, name, order")
+      .eq("session_id", data)
+      .order("order");
+    if (timerError) { serverError(res, timerError); return; }
+    const firstWork = defaultTimers?.find((timer) => timer.name.toLowerCase() !== "break");
+    const firstBreak = defaultTimers?.find((timer) => timer.name.toLowerCase() === "break");
+    const breakMinutes = starterFocusMinutes <= 25 ? 5 : starterFocusMinutes <= 35 ? 10 : 15;
+    await Promise.all([
+      firstWork
+        ? supabase.from("timers").update({ duration: starterFocusMinutes * 60 }).eq("id", firstWork.id)
+        : Promise.resolve(),
+      firstBreak
+        ? supabase.from("timers").update({ duration: breakMinutes * 60 }).eq("id", firstBreak.id)
+        : Promise.resolve(),
+    ]);
+    cache.del(`timers:${data}`);
   }
 
   res.status(201).json({ data: { session_id: data, code } });

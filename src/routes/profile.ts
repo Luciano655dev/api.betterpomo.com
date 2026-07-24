@@ -25,6 +25,19 @@ function withEntitlements<T extends Partial<PlanRow>>(row: T): T & { entitlement
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // Same rule the registration route enforces — usernames appear in URLs and @mentions.
 const USERNAME_RE = /^[a-z0-9_]{3,24}$/;
+const PERSONALIZATION_CACHE_PREFIX = "personalization:";
+const FOCUS_CATEGORIES = ["study", "work", "build", "read", "other"] as const;
+const FOCUS_GOALS = ["finish", "deadline", "habit", "progress", "structure"] as const;
+const FOCUS_STYLES = ["solo", "friends", "team"] as const;
+const FOCUS_PEAKS = ["morning", "afternoon", "evening", "night"] as const;
+const FOCUS_OBSTACLES = ["procrastination", "distractions", "consistency", "burnout"] as const;
+const MOTIVATION_STYLES = ["progress", "streaks", "accountability", "gentle"] as const;
+const WEEKLY_TARGETS = [2, 3, 5, 7] as const;
+const FOCUS_MINUTES = [15, 25, 35, 55] as const;
+
+function oneOf<T extends readonly unknown[]>(value: unknown, values: T): value is T[number] {
+  return values.includes(value as never);
+}
 
 function usernameBase(user: { id: string; email?: string; user_metadata?: Record<string, unknown> }): string {
   const meta = user.user_metadata ?? {};
@@ -84,6 +97,78 @@ async function verifyPassword(email: string, password: string): Promise<boolean>
 function hasPasswordIdentity(user: { identities?: { provider: string }[] }): boolean {
   return (user.identities ?? []).some((i) => i.provider === "email");
 }
+
+/** Private onboarding answers used by the mobile app and future personalization. */
+router.get("/personalization", authenticate, async (req, res) => {
+  const { user, supabase } = req;
+  const cacheKey = `${PERSONALIZATION_CACHE_PREFIX}${user.id}`;
+  const hit = cache.get(cacheKey);
+  if (hit) { res.json({ data: hit }); return; }
+
+  const { data, error } = await supabase
+    .from("user_personalization")
+    .select("survey_version, focus_category, focus_goal, focus_style, focus_peak, weekly_target_days, preferred_focus_minutes, focus_obstacle, motivation_style, created_at, updated_at")
+    .eq("user_id", user.id)
+    .maybeSingle();
+  if (error) { serverError(res, error); return; }
+  if (data) cache.set(cacheKey, data, TTL.PROFILE);
+  res.json({ data: data ?? null });
+});
+
+/** Idempotently persist one complete onboarding survey. */
+router.put("/personalization", authenticate, async (req, res) => {
+  const { user, supabase } = req;
+  const body = req.body ?? {};
+  if (
+    !oneOf(body.focus_category, FOCUS_CATEGORIES)
+    || !oneOf(body.focus_goal, FOCUS_GOALS)
+    || !oneOf(body.focus_style, FOCUS_STYLES)
+    || !oneOf(body.focus_peak, FOCUS_PEAKS)
+    || !oneOf(body.weekly_target_days, WEEKLY_TARGETS)
+    || !oneOf(body.preferred_focus_minutes, FOCUS_MINUTES)
+    || !oneOf(body.focus_obstacle, FOCUS_OBSTACLES)
+    || !oneOf(body.motivation_style, MOTIVATION_STYLES)
+  ) {
+    res.status(400).json({ error: "A complete, valid personalization survey is required" });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  const payload = {
+    user_id: user.id,
+    survey_version: 3,
+    focus_category: body.focus_category,
+    focus_goal: body.focus_goal,
+    focus_style: body.focus_style,
+    focus_peak: body.focus_peak,
+    weekly_target_days: body.weekly_target_days,
+    preferred_focus_minutes: body.preferred_focus_minutes,
+    focus_obstacle: body.focus_obstacle,
+    motivation_style: body.motivation_style,
+    updated_at: now,
+  };
+  const { data, error } = await supabase
+    .from("user_personalization")
+    .upsert(payload, { onConflict: "user_id" })
+    .select("survey_version, focus_category, focus_goal, focus_style, focus_peak, weekly_target_days, preferred_focus_minutes, focus_obstacle, motivation_style, created_at, updated_at")
+    .single();
+  if (error) { serverError(res, error); return; }
+
+  const { error: profileError } = await supabase
+    .from("profiles")
+    .update({
+      focus_category: body.focus_category,
+      focus_style: body.focus_style,
+      focus_peak: body.focus_peak,
+    })
+    .eq("id", user.id);
+  if (profileError) { serverError(res, profileError); return; }
+
+  cache.del(`${PERSONALIZATION_CACHE_PREFIX}${user.id}`);
+  invalidateIdentity(user.id);
+  cache.set(`${PERSONALIZATION_CACHE_PREFIX}${user.id}`, data, TTL.PROFILE);
+  res.json({ data });
+});
 
 /** GET /api/profile — returns the authenticated user's profile */
 router.get("/", authenticate, async (req, res) => {
@@ -172,11 +257,8 @@ router.patch("/", authenticate, async (req, res) => {
   if (typeof body.is_private === "boolean") patch.is_private = body.is_private;
   if (typeof body.onboarding_completed === "boolean") patch.onboarding_completed = body.onboarding_completed;
   if (typeof body.marketing_emails === "boolean") patch.marketing_emails = body.marketing_emails;
-  const FOCUS_CATEGORIES = ["study", "work", "build", "read", "other"];
-  const FOCUS_STYLES = ["solo", "friends", "team"];
   if (typeof body.focus_category === "string" && FOCUS_CATEGORIES.includes(body.focus_category)) patch.focus_category = body.focus_category;
   if (typeof body.focus_style === "string" && FOCUS_STYLES.includes(body.focus_style)) patch.focus_style = body.focus_style;
-  const FOCUS_PEAKS = ["morning", "afternoon", "evening", "night"];
   if (typeof body.focus_peak === "string" && FOCUS_PEAKS.includes(body.focus_peak)) patch.focus_peak = body.focus_peak;
   if (!Object.keys(patch).length) { res.status(400).json({ error: "Nothing to update" }); return; }
 

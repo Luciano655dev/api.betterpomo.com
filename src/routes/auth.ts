@@ -2,6 +2,7 @@ import { Router } from "express";
 import { adminDb, createAnonClient } from "../lib/supabase";
 import { serverError } from "../lib/http";
 import { escapeLike } from "../lib/utils";
+import { sendConfirmationCode, sendPasswordRecovery } from "../lib/authEmail";
 
 const router = Router();
 
@@ -44,14 +45,24 @@ function isEmailNotConfirmed(error: { code?: string; message?: string } | null):
     || error?.message?.toLowerCase().includes("email not confirmed") === true;
 }
 
+function deliveryFailure(
+  res: Parameters<typeof serverError>[0],
+  error: string,
+) {
+  res.status(502).json({
+    error: `We couldn't send the confirmation email. ${error}`,
+    code: "email_delivery_failed",
+  });
+}
+
 /**
  * POST /api/auth/register — PUBLIC (no authenticate middleware).
  * Body: { email, password, username }
  *
- * Creates the account through the anon client so Supabase applies its normal
- * signup policy (email confirmation, etc.). The username is pre-checked against
- * `profiles` for a friendlier error than the DB unique-violation, and stored in
- * user_metadata so the `handle_new_user` trigger picks it up.
+ * Creates the account through Supabase Admin's link generator, which returns an
+ * OTP without invoking SMTP. The API sends that OTP through Resend. The username
+ * is pre-checked against `profiles` for a friendlier error than the DB
+ * unique-violation, and stored in user_metadata for `handle_new_user`.
  *
  * Returns { user, session }. `session` is null when email confirmation is
  * required — clients should tell the user to check their inbox.
@@ -93,33 +104,51 @@ router.post("/register", async (req, res) => {
   if (lookupError) { serverError(res, lookupError); return; }
   if (taken) { res.status(400).json({ error: "That username is already taken" }); return; }
 
-  const anon = createAnonClient();
-  const { data, error } = await anon.auth.signUp({
+  // Generate the signup OTP without asking Supabase SMTP to send it. The API
+  // logs and delivers the code through Resend below, so provider failures are
+  // visible and cannot leave the client on a false-success confirmation screen.
+  const { data, error } = await adminDb.auth.admin.generateLink({
+    type: "signup",
     email,
     password,
     options: { data: { username } },
   });
   if (error) {
-    console.error("auth.register signup failed:", error.message);
+    if (
+      error.message.toLowerCase().includes("already")
+      || error.message.toLowerCase().includes("registered")
+    ) {
+      res.status(409).json({
+        error: "An account already exists for this email. Sign in instead.",
+        code: "account_exists",
+      });
+      return;
+    }
+    console.error("auth.register signup generation failed:", error.message);
     res.status(400).json({ error: error.message });
     return;
   }
 
-  // Supabase deliberately returns an obfuscated successful response for a
-  // repeated signup. In that case no new confirmation message is guaranteed;
-  // explicitly request one so an abandoned confirmation screen is recoverable.
-  // A brand-new signup has an identity and already triggered its first email.
-  if (!data.session && data.user && (data.user.identities?.length ?? 0) === 0) {
-    const { error: resendError } = await anon.auth.resend({ type: "signup", email });
-    if (resendError) {
-      console.error("auth.register repeated-signup resend failed:", resendError.message);
-    }
+  if (!data.user || !data.properties?.email_otp || !data.properties.hashed_token) {
+    res.status(500).json({ error: "Account created, but a confirmation code could not be generated" });
+    return;
+  }
+
+  const delivery = await sendConfirmationCode({
+    email,
+    code: data.properties.email_otp,
+    tokenHash: data.properties.hashed_token,
+    action: "signup",
+  });
+  if (!delivery.ok) {
+    deliveryFailure(res, delivery.error);
+    return;
   }
 
   res.json({
     data: {
-      user: data.user ? { id: data.user.id, email: data.user.email } : null,
-      session: publicSession(data.session),
+      user: { id: data.user.id, email: data.user.email },
+      session: null,
     },
   });
 });
@@ -160,12 +189,37 @@ router.post("/login", async (req, res) => {
   const { data, error } = await anon.auth.signInWithPassword({ email, password });
   if (error) {
     if (isEmailNotConfirmed(error)) {
-      const { error: resendError } = await anon.auth.resend({ type: "signup", email });
-      if (resendError) console.error("auth.login confirmation resend failed:", resendError.message);
+      const generated = await adminDb.auth.admin.generateLink({
+        type: "recovery",
+        email,
+        options: { redirectTo: WEB_URL },
+      });
+      if (
+        generated.error
+        || !generated.data.properties?.email_otp
+        || !generated.data.properties.hashed_token
+      ) {
+        console.error(
+          "auth.login confirmation generation failed:",
+          generated.error?.message ?? "missing OTP",
+        );
+        deliveryFailure(res, "Please try again.");
+        return;
+      }
+      const delivery = await sendConfirmationCode({
+        email,
+        code: generated.data.properties.email_otp,
+        tokenHash: generated.data.properties.hashed_token,
+        action: "unconfirmed_login",
+      });
+      if (!delivery.ok) {
+        deliveryFailure(res, delivery.error);
+        return;
+      }
       res.status(403).json({
         error: "Confirm your email to sign in.",
         code: "email_not_confirmed",
-        verification_sent: !resendError,
+        verification_sent: true,
       });
       return;
     }
@@ -217,7 +271,14 @@ router.post("/verify-email", async (req, res) => {
   }
 
   const anon = createAnonClient();
-  const { data, error } = await anon.auth.verifyOtp({ email, token, type: "email" });
+  let { data, error } = await anon.auth.verifyOtp({ email, token, type: "email" });
+  if (error) {
+    // Resends and unconfirmed-login codes are generated as recovery OTPs so
+    // Supabase can generate them for an existing account without sending SMTP.
+    const recovery = await anon.auth.verifyOtp({ email, token, type: "recovery" });
+    data = recovery.data;
+    error = recovery.error;
+  }
   if (error) {
     res.status(400).json({ error: "That code is invalid or has expired. Request a new code and try again." });
     return;
@@ -239,8 +300,8 @@ router.post("/verify-email", async (req, res) => {
  * POST /api/auth/resend-verification — PUBLIC.
  * Body: { email }
  *
- * Sends a fresh signup code. Supabase applies its own per-address cooldown in
- * addition to the API's per-IP email rate limit.
+ * Generates a fresh recovery OTP for an existing account and delivers it as a
+ * confirmation code. The API's per-IP email rate limit prevents abuse.
  */
 router.post("/resend-verification", async (req, res) => {
   const rawIdentifier = req.body?.identifier ?? req.body?.email;
@@ -261,11 +322,30 @@ router.post("/resend-verification", async (req, res) => {
   // same success shape, but no provider request is made.
   if (!email) { res.json({ data: { ok: true } }); return; }
 
-  const anon = createAnonClient();
-  const { error } = await anon.auth.resend({ type: "signup", email });
-  if (error) {
-    console.error("auth.resend-verification failed:", error.message);
-    res.status(400).json({ error: error.message });
+  const generated = await adminDb.auth.admin.generateLink({
+    type: "recovery",
+    email,
+    options: { redirectTo: WEB_URL },
+  });
+  if (generated.error) {
+    // Keep unknown-address behavior non-enumerating.
+    console.error("auth.resend-verification generation failed:", generated.error.message);
+    res.json({ data: { ok: true } });
+    return;
+  }
+  if (!generated.data.properties?.email_otp || !generated.data.properties.hashed_token) {
+    deliveryFailure(res, "Please try again.");
+    return;
+  }
+
+  const delivery = await sendConfirmationCode({
+    email,
+    code: generated.data.properties.email_otp,
+    tokenHash: generated.data.properties.hashed_token,
+    action: "resend",
+  });
+  if (!delivery.ok) {
+    deliveryFailure(res, delivery.error);
     return;
   }
 
@@ -276,8 +356,8 @@ router.post("/resend-verification", async (req, res) => {
  * POST /api/auth/forgot-password — PUBLIC.
  * Body: { email }
  *
- * Sends a Supabase recovery email linking to the webapp's reset form. Always
- * responds ok so the endpoint can't be used to probe which emails have accounts.
+ * Generates a Supabase recovery link without SMTP, then sends it through Resend.
+ * Always responds ok so the endpoint can't probe which emails have accounts.
  */
 router.post("/forgot-password", async (req, res) => {
   const rawEmail = req.body?.email;
@@ -287,13 +367,29 @@ router.post("/forgot-password", async (req, res) => {
     return;
   }
 
-  const anon = createAnonClient();
-  const { error } = await anon.auth.resetPasswordForEmail(email, {
-    redirectTo: `${WEB_URL}/auth/callback?next=/reset-password`,
+  const { data, error } = await adminDb.auth.admin.generateLink({
+    type: "recovery",
+    email,
+    options: { redirectTo: `${WEB_URL}/auth/callback?next=/reset-password` },
   });
-  // Log real failures (misconfigured SMTP, bad redirect URL) but never expose
-  // whether the address has an account.
-  if (error) console.error("forgot-password:", error.message);
+  if (error) {
+    // Keep the public response non-enumerating.
+    console.error("forgot-password generation:", error.message);
+    res.json({ data: { ok: true } });
+    return;
+  }
+  if (
+    data.properties?.email_otp
+    && data.properties.hashed_token
+    && data.properties.action_link
+  ) {
+    await sendPasswordRecovery({
+      email,
+      code: data.properties.email_otp,
+      tokenHash: data.properties.hashed_token,
+      actionLink: data.properties.action_link,
+    });
+  }
 
   res.json({ data: { ok: true } });
 });

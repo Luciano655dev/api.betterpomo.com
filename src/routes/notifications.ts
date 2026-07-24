@@ -8,13 +8,37 @@ import { isExpoPushToken } from "../lib/push";
 const router = Router();
 router.use(authenticate);
 
-const DEFAULT_PREFERENCES = {
+const DEFAULT_CATEGORY_PREFERENCES = {
   timers: true,
   friends: true,
   sessions: true,
   messages: true,
   account: true,
+  routines: false,
 };
+const DEFAULT_PREFERENCES = {
+  ...DEFAULT_CATEGORY_PREFERENCES,
+  routine_weekdays: [] as number[],
+  routine_time: null as string | null,
+  routine_timezone: null as string | null,
+};
+
+function validWeekdays(value: unknown): value is number[] {
+  return Array.isArray(value)
+    && value.length <= 7
+    && value.every((day) => Number.isInteger(day) && day >= 1 && day <= 7)
+    && new Set(value).size === value.length;
+}
+
+function validTimezone(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 100) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /** POST /api/notifications/devices — register or refresh one app installation. */
 router.post("/devices", async (req, res) => {
@@ -69,7 +93,7 @@ router.get("/preferences", async (req, res) => {
   const { user, supabase } = req;
   const { data, error } = await supabase
     .from("notification_preferences")
-    .select("timers, friends, sessions, messages, account")
+    .select("timers, friends, sessions, messages, account, routines, routine_weekdays, routine_time, routine_timezone")
     .eq("user_id", user.id)
     .maybeSingle();
   if (error) { serverError(res, error); return; }
@@ -79,8 +103,8 @@ router.get("/preferences", async (req, res) => {
 /** PATCH /api/notifications/preferences — update one or more category toggles. */
 router.patch("/preferences", async (req, res) => {
   const { user, supabase } = req;
-  const updates: Record<string, boolean | string> = { user_id: user.id, updated_at: new Date().toISOString() };
-  for (const key of Object.keys(DEFAULT_PREFERENCES) as (keyof typeof DEFAULT_PREFERENCES)[]) {
+  const updates: Record<string, boolean | string | number[] | null> = { user_id: user.id, updated_at: new Date().toISOString() };
+  for (const key of Object.keys(DEFAULT_CATEGORY_PREFERENCES) as (keyof typeof DEFAULT_CATEGORY_PREFERENCES)[]) {
     if (req.body?.[key] !== undefined) {
       if (typeof req.body[key] !== "boolean") {
         res.status(400).json({ error: `${key} must be a boolean` }); return;
@@ -88,12 +112,30 @@ router.patch("/preferences", async (req, res) => {
       updates[key] = req.body[key];
     }
   }
+  if (req.body?.routine_weekdays !== undefined) {
+    if (!validWeekdays(req.body.routine_weekdays)) {
+      res.status(400).json({ error: "routine_weekdays must contain unique weekdays from 1 to 7" }); return;
+    }
+    updates.routine_weekdays = [...req.body.routine_weekdays].sort((a, b) => a - b);
+  }
+  if (req.body?.routine_time !== undefined) {
+    if (req.body.routine_time !== null && (typeof req.body.routine_time !== "string" || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(req.body.routine_time))) {
+      res.status(400).json({ error: "routine_time must use HH:mm" }); return;
+    }
+    updates.routine_time = req.body.routine_time;
+  }
+  if (req.body?.routine_timezone !== undefined) {
+    if (req.body.routine_timezone !== null && !validTimezone(req.body.routine_timezone)) {
+      res.status(400).json({ error: "routine_timezone must be a valid IANA timezone" }); return;
+    }
+    updates.routine_timezone = req.body.routine_timezone;
+  }
   if (Object.keys(updates).length === 2) {
     res.status(400).json({ error: "At least one notification preference is required" }); return;
   }
   const { data, error } = await supabase.from("notification_preferences")
     .upsert(updates, { onConflict: "user_id" })
-    .select("timers, friends, sessions, messages, account")
+    .select("timers, friends, sessions, messages, account, routines, routine_weekdays, routine_time, routine_timezone")
     .single();
   if (error) { serverError(res, error); return; }
   res.json({ data });

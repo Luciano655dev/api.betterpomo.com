@@ -18,6 +18,7 @@ import emailRouter from "./routes/email";
 import billingRouter, { stripeWebhookHandler } from "./routes/billing";
 import templatesRouter from "./routes/templates";
 import statusRouter from "./routes/status";
+import { authEmailHookHandler } from "./routes/authEmailHook";
 import { startEmailScheduler } from "./lib/emailScheduler";
 import { startTrialReminderSweep } from "./lib/trialReminders";
 import { redis } from "./lib/redis";
@@ -94,6 +95,13 @@ app.use(helmet({ contentSecurityPolicy: false }));
 // /api global limiter: Stripe's servers are the only caller, and signature
 // verification rejects everything else.
 app.post("/api/billing/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
+// Supabase signs the exact request bytes for Auth HTTP hooks. Mount this before
+// express.json() so signature verification receives the untouched payload.
+app.post(
+  "/api/auth/send-email-hook",
+  express.raw({ type: "application/json", limit: "100kb" }),
+  authEmailHookHandler,
+);
 app.use(express.json({ limit: "100kb" }));
 
 // Health check is intentionally before the limiter so uptime probes never count

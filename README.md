@@ -18,6 +18,9 @@ Built by [Luciano Menezes](https://github.com/luciano655dev).
 - Server-side in-memory caching with per-endpoint TTLs, invalidated on mutation.
 - Emits notifications, handles Stripe & RevenueCat billing webhooks, and applies
   entitlement gates for paid plans.
+- Generates signup, resend, and recovery tokens through Supabase Admin, then
+  delivers them through Resend with development code logging and provider-level
+  delivery errors. A signed hook covers any Auth mail triggered outside the API.
 
 ---
 
@@ -57,8 +60,16 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your-anon-key
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 WEB_URL=http://localhost:3000
+RESEND_API_KEY=your-resend-key
+RESEND_FROM_EMAIL=no-reply@auth.betterpomo.com
+AUTH_FROM_EMAIL=no-reply@auth.betterpomo.com
+# Optional for Supabase-triggered Auth emails outside API registration/recovery:
+SEND_EMAIL_HOOK_SECRET=v1,whsec_your-supabase-hook-secret
 # Optional: REDIS_URL, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, BILLING_ENABLED=false
 ```
+
+See [`docs/AUTH_EMAIL_SETUP.md`](docs/AUTH_EMAIL_SETUP.md) for the one-time
+Supabase Send Email hook setup and safe OTP logging controls.
 
 ### 3. Database
 
@@ -78,8 +89,9 @@ npm start       # node dist/index.js
 
 ## API surface
 
-All routes require an `Authorization: Bearer <supabase-jwt>` header (except the
-Stripe webhook and the public wishlist endpoint). Responses are wrapped as
+All routes require an `Authorization: Bearer <supabase-jwt>` header unless
+explicitly public (Auth, Stripe/RevenueCat webhooks, wishlist, contact, and
+status). Responses are wrapped as
 `{ data }` or `{ error }`.
 
 | Router | Base path | Purpose |
@@ -95,6 +107,7 @@ Stripe webhook and the public wishlist endpoint). Responses are wrapped as
 | `templates` | `/api/templates` | Saved session timer templates (Pro) |
 | `feedback` | `/api/feedback` | Public feedback board + voting |
 | `wishlist` | `/api/wishlist` | Public waitlist signup |
+| `auth` | `/api/auth` | Registration, login, verification, recovery, and signed email hook |
 
 ---
 
