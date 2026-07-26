@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import bcrypt from "bcryptjs";
 import { randomUUID } from "crypto";
 import { serverError } from "../lib/http";
@@ -19,6 +19,10 @@ import {
 } from "../lib/plans";
 
 const router = Router();
+
+// Lap names render in a fixed-width column in both clients; keep them short
+// enough that the table never has to fight the text.
+const LAP_NAME_MAX = 40;
 
 // `last_activity_at` was added after the session API started shipping. Keep
 // mutations compatible with databases that have not applied the inactivity
@@ -59,6 +63,31 @@ async function getActiveSessionId(supabase: SupabaseClient, userId: string): Pro
 
 const ALREADY_IN_SESSION =
   "You're already in a session. Leave it before starting or joining another.";
+
+/** True when Postgres reports the function itself does not exist (42883). */
+function isMissingFunction(error: { code?: string; message?: string }): boolean {
+  return error.code === "42883"
+    || error.code === "PGRST202"
+    || (error.message ?? "").includes("Could not find the function");
+}
+
+/**
+ * Refuse a join with a reason both the user and the logs can act on.
+ *
+ * `code` is the stable machine-readable reason the clients switch on; `message`
+ * is what the user reads. Every refusal is logged with the session and user so
+ * a support question ("why can't I join?") can be answered from the logs.
+ */
+function denyJoin(
+  res: Response,
+  status: number,
+  code: string,
+  message: string,
+  context: Record<string, unknown>,
+): void {
+  console.warn(`[join] denied: ${code}`, context);
+  res.status(status).json({ error: message, code });
+}
 
 /** Broadcast a local-only chat divider when someone genuinely joins/rejoins.
  *  This deliberately uses Realtime Broadcast instead of a table row: session
@@ -368,17 +397,27 @@ router.post("/join", authenticate, async (req, res) => {
   const { data: sessionRow, error: lookupError } = await supabase
     .from("pomodoro_sessions").select("*").eq("code", code).single();
   if (lookupError) {
-    const status = lookupError.code === "PGRST116" ? 404 : 500;
-    res.status(status).json({ error: lookupError.code === "PGRST116" ? "Session not found" : lookupError.message }); return;
+    if (lookupError.code === "PGRST116") {
+      denyJoin(res, 404, "session_not_found", "No session exists with that code.", { code, userId: user.id });
+      return;
+    }
+    serverError(res, lookupError, `join:lookup:${code}`);
+    return;
   }
 
   const session = sessionRow as Record<string, unknown>;
-  if (session.status === "ended") { res.status(410).json({ error: "Session has ended" }); return; }
+  const joinLog = { code, sessionId: session.id as string, userId: user.id };
+
+  if (session.status === "ended") {
+    denyJoin(res, 410, "session_ended", "This session has already ended.", joinLog);
+    return;
+  }
 
   // One session at a time — re-entering the same session is always fine.
   const currentSessionId = await getActiveSessionId(supabase, user.id);
   if (currentSessionId && currentSessionId !== session.id) {
-    res.status(409).json({ error: ALREADY_IN_SESSION }); return;
+    denyJoin(res, 409, "already_in_session", ALREADY_IN_SESSION, joinLog);
+    return;
   }
 
   // Check if this user is already a participant (existing participants bypass password)
@@ -394,14 +433,24 @@ router.post("/join", authenticate, async (req, res) => {
     const hash = (session.password_hash as string | null) ?? null;
     if (hash) {
       const supplied = typeof body.password === "string" ? body.password : "";
-      const valid = await bcrypt.compare(supplied, hash);
-      if (!valid) {
-        // The caller is authenticated but is not authorized to enter this
-        // protected session. A 401 makes browser clients assume their login
-        // token expired and redirect to /login; 403 correctly preserves the
-        // password gate.
-        res.status(403).json({ error: "Incorrect password" }); return;
+      // "Nothing supplied" and "wrong password" are different situations for
+      // the UI: the first opens the password prompt, the second re-prompts with
+      // an error. Collapsing them into one message is why a private session
+      // used to fail with no explanation.
+      if (!supplied) {
+        denyJoin(res, 403, "password_required", "This session is private — it needs its password to join.", joinLog);
+        return;
       }
+      // A 401 here would make browser clients assume their login token expired
+      // and redirect to /login; 403 correctly preserves the password gate.
+      if (!(await bcrypt.compare(supplied, hash))) {
+        denyJoin(res, 403, "incorrect_password", "That session password is not correct.", joinLog);
+        return;
+      }
+    } else if (session.is_private === true) {
+      // Private with no password set: code-only access, nothing more to check.
+      // Recorded because it is the case that used to be rejected outright.
+      console.info("[join] private session, no password set — allowing by code", joinLog);
     }
   }
 
@@ -415,19 +464,47 @@ router.post("/join", authenticate, async (req, res) => {
   // so p_max_participants must not be passed.
   const ownerEnt = await getUserEntitlements(session.owner_id as string);
 
-  // Use a user-scoped client so auth.uid() resolves correctly inside the RPC
-  const userClient = createAuthClient(token);
-  const { error: joinError } = await userClient.rpc("join_pomo_session", {
+  const username = profile?.username ?? (user.email?.split("@")[0] ?? "User");
+  const capArg = BILLING_ENABLED ? { p_max_participants: ownerEnt.maxParticipants } : {};
+
+  // join_pomo_session_verified skips the RPC's blanket private-session refusal
+  // (see migration_private_session_join.sql) — every check it would have made
+  // has been made above, including the password. It is service-role only, so
+  // `supabase` (adminDb) must be the caller and the user id has to be explicit.
+  let { error: joinError } = await supabase.rpc("join_pomo_session_verified", {
     p_session_id: session.id as string,
-    p_username: profile?.username ?? (user.email?.split("@")[0] ?? "User"),
-    ...(BILLING_ENABLED ? { p_max_participants: ownerEnt.maxParticipants } : {}),
+    p_user_id: user.id,
+    p_username: username,
+    ...capArg,
   });
+
+  // Fall back to the original RPC where the migration has not been applied yet,
+  // so joining public sessions keeps working on an un-migrated database.
+  if (joinError && isMissingFunction(joinError)) {
+    console.warn("[join] join_pomo_session_verified missing — apply migration_private_session_join.sql", joinLog);
+    const userClient = createAuthClient(token);
+    ({ error: joinError } = await userClient.rpc("join_pomo_session", {
+      p_session_id: session.id as string,
+      p_username: username,
+      ...capArg,
+    }));
+  }
+
   if (joinError) {
     if (joinError.message.includes("Session is full")) {
-      res.status(409).json({ error: "session_full", max: ownerEnt.maxParticipants }); return;
+      console.warn("[join] denied: session_full", { ...joinLog, max: ownerEnt.maxParticipants });
+      res.status(409).json({ error: "session_full", code: "session_full", max: ownerEnt.maxParticipants });
+      return;
     }
-    res.status(400).json({ error: joinError.message }); return;
+    if (joinError.message.includes("This session is private")) {
+      denyJoin(res, 403, "session_private", "This session is private — ask the host for an invite.", joinLog);
+      return;
+    }
+    console.error("[join] rpc failed", { ...joinLog, error: joinError.message });
+    res.status(400).json({ error: joinError.message, code: "join_failed" });
+    return;
   }
+  console.info("[join] joined", { ...joinLog, rejoin: !!existingParticipant });
 
   const shouldJoinAsMember =
     session.owner_id !== user.id && (!existingParticipant || existingParticipant.left_at !== null);
@@ -929,6 +1006,9 @@ router.post("/:id/laps", authenticate, async (req, res) => {
   if (typeof body?.duration_seconds !== "number" || body.duration_seconds < 0) {
     res.status(400).json({ error: "duration_seconds is required" }); return;
   }
+  if (typeof body.name === "string" && body.name.trim().length > LAP_NAME_MAX) {
+    res.status(400).json({ error: `Lap name must be ${LAP_NAME_MAX} characters or less` }); return;
+  }
 
   const { data: existing } = await supabase
     .from("stopwatch_laps").select("lap_number").eq("session_id", id).order("lap_number", { ascending: false }).limit(1);
@@ -953,6 +1033,9 @@ router.patch("/:id/laps/:lapId", authenticate, async (req, res) => {
   if (!(await requireManager(supabase, String(id), user.id, res))) return;
   if (typeof body?.name !== "string" || !body.name.trim()) {
     res.status(400).json({ error: "name is required" }); return;
+  }
+  if (body.name.trim().length > LAP_NAME_MAX) {
+    res.status(400).json({ error: `Lap name must be ${LAP_NAME_MAX} characters or less` }); return;
   }
   const { data, error } = await supabase
     .from("stopwatch_laps").update({ name: body.name.trim() }).eq("id", lapId).eq("session_id", id).select().single();

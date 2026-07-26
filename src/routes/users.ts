@@ -30,6 +30,7 @@ async function resolveProfileByUsername(
     .select(columns)
     .eq("username", username)
     .eq("id", viewerId)
+    .is("deleted_at", null)
     .maybeSingle();
   if (own.error) return { profile: null, error: own.error };
   if (own.data) return { profile: own.data as unknown as Record<string, unknown>, error: null };
@@ -38,6 +39,8 @@ async function resolveProfileByUsername(
     .from("profiles")
     .select(columns)
     .eq("username", username)
+    // Soft-deleted accounts are gone as far as the product is concerned.
+    .is("deleted_at", null)
     .order("created_at", { ascending: true })
     .limit(1);
   return {
@@ -61,6 +64,7 @@ router.get("/search", async (req, res) => {
   let query = req.supabase
     .from("profiles")
     .select("id, username, display_name, emoji, bio, is_private", { count: "exact" })
+    .is("deleted_at", null)
     .order("display_name")
     .range(from, to);
 
