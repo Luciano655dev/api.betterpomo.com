@@ -254,7 +254,9 @@ router.get("/mine/active", authenticate, async (req, res) => {
 
 /** POST /api/sessions
  *  Create a new session.
- *  Body: { name: string, is_private?: boolean, password?: string, session_type?: 'pomodoro' | 'stopwatch' } */
+ *  Body: { name: string, is_private?: boolean, password?: string,
+ *    session_type?: 'pomodoro' | 'stopwatch',
+ *    starter_focus_minutes?: 15 | 25 | 35 | 45 | 55 } */
 router.post("/", authenticate, async (req, res) => {
   const { user, supabase, token } = req;
   const body = req.body;
@@ -281,7 +283,7 @@ router.post("/", authenticate, async (req, res) => {
   const passwordHash = rawPassword ? await bcrypt.hash(rawPassword, 10) : null;
 
   const sessionType = body.session_type === "stopwatch" ? "stopwatch" : "pomodoro";
-  const starterFocusMinutes = [15, 25, 35, 55].includes(body.starter_focus_minutes)
+  const starterFocusMinutes = [15, 25, 35, 45, 55].includes(body.starter_focus_minutes)
     ? Number(body.starter_focus_minutes)
     : null;
 
@@ -684,6 +686,10 @@ router.patch("/:id", authenticate, async (req, res) => {
   if (body.action) {
     switch (body.action) {
       case "start": {
+        const requestedIndex = typeof body.index === "number" ? body.index : session.current_timer_index;
+        // Treat a retried start as success instead of restarting an already
+        // running timer. Clients can safely retry after a lost response.
+        if (session.timer_state === "running" && requestedIndex === session.current_timer_index) break;
         const fields: Record<string, unknown> = {
           timer_state: "running",
           status: "active",
@@ -692,24 +698,30 @@ router.patch("/:id", authenticate, async (req, res) => {
         };
         if (typeof body.index === "number") fields.current_timer_index = body.index;
         const { error } = await supabase
-          .from("pomodoro_sessions").update(fields).eq("id", id).eq("timer_state", "idle");
+          .from("pomodoro_sessions").update(fields).eq("id", id);
         if (error) { serverError(res, error); return; }
         break;
       }
 
       case "pause": {
-        if (!session.timer_started_at) { res.status(400).json({ error: "Timer is not running" }); return; }
+        if (session.timer_state === "paused") break;
+        if (session.timer_state !== "running" || !session.timer_started_at) {
+          res.status(409).json({ error: "Timer state changed before it could be paused" }); return;
+        }
         const elapsed = (now.getTime() - new Date(session.timer_started_at).getTime()) / 1000;
         const { error } = await supabase
           .from("pomodoro_sessions")
           .update({ timer_state: "paused", paused_elapsed_seconds: elapsed })
-          .eq("id", id).eq("timer_state", "running");
+          .eq("id", id);
         if (error) { serverError(res, error); return; }
         break;
       }
 
       case "resume": {
-        if (session.paused_elapsed_seconds == null) { res.status(400).json({ error: "Timer is not paused" }); return; }
+        if (session.timer_state === "running") break;
+        if (session.timer_state !== "paused" || session.paused_elapsed_seconds == null) {
+          res.status(409).json({ error: "Timer state changed before it could be resumed" }); return;
+        }
         const { error } = await supabase
           .from("pomodoro_sessions")
           .update({
@@ -717,7 +729,7 @@ router.patch("/:id", authenticate, async (req, res) => {
             timer_started_at: new Date(now.getTime() - session.paused_elapsed_seconds * 1000).toISOString(),
             paused_elapsed_seconds: null,
           })
-          .eq("id", id).eq("timer_state", "paused");
+          .eq("id", id);
         if (error) { serverError(res, error); return; }
         break;
       }
@@ -739,7 +751,7 @@ router.patch("/:id", authenticate, async (req, res) => {
         };
         if (typeof body.index === "number") fields.current_timer_index = body.index;
         const { error } = await supabase
-          .from("pomodoro_sessions").update(fields).eq("id", id).neq("timer_state", "idle");
+          .from("pomodoro_sessions").update(fields).eq("id", id);
         if (error) { serverError(res, error); return; }
         break;
       }
@@ -824,7 +836,12 @@ router.patch("/:id", authenticate, async (req, res) => {
       }
     }
 
-    const { data: updated } = await supabase.from("pomodoro_sessions").select("*").eq("id", id).single();
+    const { data: updated, error: updatedError } = await supabase
+      .from("pomodoro_sessions")
+      .select("*")
+      .eq("id", id)
+      .single();
+    if (updatedError) { serverError(res, updatedError); return; }
     res.json({ data: { session: updated } });
     return;
   }
