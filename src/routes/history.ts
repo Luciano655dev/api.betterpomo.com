@@ -12,6 +12,7 @@ const router = Router();
 // can hold so a crafted client cannot store megabytes per session.
 const MAX_TIMER_SECONDS = 24 * 60 * 60;
 const MAX_HISTORY_PARTICIPANTS = 50;
+const MAX_SESSION_NAME_LENGTH = 100;
 
 /** Free-plan cutoff: entries older than this many days are hidden (kept in the
  *  DB — they unlock instantly on upgrade). Null historyDays = no cutoff. */
@@ -421,7 +422,16 @@ router.patch("/:id", authenticate, async (req, res) => {
   if (!body) { res.status(400).json({ error: "Request body required" }); return; }
 
   const patch: Record<string, unknown> = {};
-  if (typeof body.session_name === "string" && body.session_name.trim()) patch.session_name = body.session_name.trim();
+  if (body.session_name !== undefined) {
+    if (typeof body.session_name !== "string" || !body.session_name.trim()) {
+      res.status(400).json({ error: "session_name must be a non-empty string" }); return;
+    }
+    const sessionName = body.session_name.trim();
+    if (sessionName.length > MAX_SESSION_NAME_LENGTH) {
+      res.status(400).json({ error: `session_name must be ${MAX_SESSION_NAME_LENGTH} characters or less` }); return;
+    }
+    patch.session_name = sessionName;
+  }
   if (typeof body.duration_seconds === "number" && body.duration_seconds >= 0) {
     const nextDuration = Math.floor(body.duration_seconds);
     patch.duration_seconds = nextDuration;

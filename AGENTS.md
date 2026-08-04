@@ -168,7 +168,7 @@ res.status(400).json({ error: "Bad request" });  // error
 | GET /:id/participants | List participants |
 | PATCH /:id/participants/me | Leave / re-join (set left_at); deletes session when last person leaves and saves history as safety net |
 | PATCH /:id/participants/:pid | Kick or change role |
-| GET /:id/messages | Compatibility endpoint; always returns empty session chat history |
-| POST /:id/messages | Validate and privately broadcast an ephemeral session chat message |
+| GET /:id/messages | Fetch bounded session-lifetime chat history (max 200 rows) |
+| POST /:id/messages | Persist for the session lifetime and privately broadcast a chat message |
 | POST /:id/laps | Record stopwatch lap |
 | GET /:id/laps | Fetch laps |
