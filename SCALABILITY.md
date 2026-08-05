@@ -6,12 +6,14 @@ applied are marked ✅; open recommendations are marked ▶.
 
 ## Deploy step (required)
 
-Run **`betterpomo-webapp/supabase/migration_scale_and_inactivity.sql`** in the
-Supabase SQL editor. It is idempotent and adds:
+Run **`betterpomo-webapp/supabase/migration_scale_and_inactivity.sql`** and
+**`betterpomo-webapp/supabase/migration_durable_session_chat.sql`** in the
+Supabase SQL editor. They are idempotent and add:
 
 - `session_participants.last_seen_at` + supporting index
 - hot-path indexes (chat, timers, laps, session browse, history dedup)
 - the `cleanup_inactive_participants()` function + a `*/15 * * * *` pg_cron job
+- bounded, replayable session chat with automatic end-of-session deletion
 
 Nothing else requires a schema change; the API changes ship with the code.
 
@@ -111,6 +113,8 @@ created_at desc)`, and a **unique** `pomodoro_history(session_id, user_id)`
   Realtime, not this API. Keep the number of tables in the `supabase_realtime`
   publication and per-session channel counts in mind; that's the more likely
   ceiling than the Express layer.
-- **Session chat has no history growth:** messages use private Realtime Broadcast
-  and only exist in connected clients' memory. DM `dm_messages` retain their 24h
-  TTL cleanup.
+- **Session chat is lifetime-bounded:** clients load at most 200 recent rows via
+  the `(session_id, created_at desc)` index and use private Realtime Broadcast
+  for live delivery. Marking a session ended deletes its chat immediately;
+  deleting a session also cascades to every message. DM `dm_messages` retain
+  their separate 24h TTL cleanup.

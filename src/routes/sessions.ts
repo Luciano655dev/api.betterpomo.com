@@ -1,11 +1,10 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import bcrypt from "bcryptjs";
-import { randomUUID } from "crypto";
 import { serverError } from "../lib/http";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { authenticate } from "../middleware/auth";
 import { perUserLimiter } from "../middleware/rateLimit";
-import { generateSessionCode, escapeLike } from "../lib/utils";
+import { clampInt, generateSessionCode, escapeLike } from "../lib/utils";
 import { cache, TTL } from "../lib/cache";
 import { createAuthClient } from "../lib/supabase";
 import { getSessionTimeMetrics } from "../lib/sessionTime";
@@ -19,6 +18,10 @@ import {
 } from "../lib/plans";
 
 const router = Router();
+
+// Lap names render in a fixed-width column in both clients; keep them short
+// enough that the table never has to fight the text.
+const LAP_NAME_MAX = 40;
 
 // `last_activity_at` was added after the session API started shipping. Keep
 // mutations compatible with databases that have not applied the inactivity
@@ -60,39 +63,153 @@ async function getActiveSessionId(supabase: SupabaseClient, userId: string): Pro
 const ALREADY_IN_SESSION =
   "You're already in a session. Leave it before starting or joining another.";
 
-/** Broadcast a local-only chat divider when someone genuinely joins/rejoins.
- *  This deliberately uses Realtime Broadcast instead of a table row: session
- *  chat history must never be persisted or replayed to later participants. */
-async function broadcastSessionJoinNotice(
+/** True when Postgres reports the function itself does not exist (42883). */
+function isMissingFunction(error: { code?: string; message?: string }): boolean {
+  return error.code === "42883"
+    || error.code === "PGRST202"
+    || (error.message ?? "").includes("Could not find the function");
+}
+
+/**
+ * Refuse a join with a reason both the user and the logs can act on.
+ *
+ * `code` is the stable machine-readable reason the clients switch on; `message`
+ * is what the user reads. Every refusal is logged with the session and user so
+ * a support question ("why can't I join?") can be answered from the logs.
+ */
+function denyJoin(
+  res: Response,
+  status: number,
+  code: string,
+  message: string,
+  context: Record<string, unknown>,
+): void {
+  console.warn(`[join] denied: ${code}`, context);
+  res.status(status).json({ error: message, code });
+}
+
+type SessionSystemEvent =
+  | "participant_joined"
+  | "participant_left"
+  | "participant_removed"
+  | "participant_promoted"
+  | "participant_demoted"
+  | "ownership_transferred"
+  | "session_renamed";
+
+type SessionChatKind = "message" | SessionSystemEvent;
+
+interface SessionChatMetadata {
+  user_id?: string;
+  username?: string;
+  display_name?: string;
+  actor_id?: string;
+  role?: "owner" | "admin" | "member";
+  previous_role?: "owner" | "admin" | "member";
+  session_name?: string;
+}
+
+interface SessionChatRow {
+  id: string;
+  content: string;
+  created_at: string;
+  user_id: string;
+  kind: SessionChatKind;
+  metadata: SessionChatMetadata | null;
+  profiles: { username: string; display_name: string; emoji: string } | null;
+}
+
+type SessionChatItem = Omit<SessionChatRow, "kind"> & {
+  type?: SessionSystemEvent;
+};
+
+function serializeSessionChatRow(row: SessionChatRow): SessionChatItem {
+  const { kind, ...message } = row;
+  return kind === "message" ? message : { ...message, type: kind };
+}
+
+/** Realtime is the fast delivery path; the database row remains authoritative
+ *  so reconnecting and newly joined clients can replay a bounded history. */
+async function broadcastSessionChatItem(
   supabase: SupabaseClient,
   sessionId: string,
-  userId: string,
+  item: SessionChatItem,
 ): Promise<void> {
-  const { data: profile } = await supabase
-    .from("profiles")
-    .select("username, display_name, emoji")
-    .eq("id", userId)
-    .maybeSingle();
-  const username = profile?.username ?? "someone";
-  const notice = {
-    id: randomUUID(),
-    type: "participant_joined",
-    content: `@${username} joined the session`,
-    created_at: new Date().toISOString(),
-    user_id: userId,
-    profiles: profile ?? { username, display_name: username, emoji: "🍅" },
-  };
-
   const channel = supabase.channel(`session:${sessionId}:chat`, { config: { private: true } });
   try {
-    const delivery = await channel.httpSend("notice", notice);
-    if (!delivery.success) console.error("session join notice could not be delivered", { sessionId, userId });
+    const delivery = await channel.httpSend(item.type ? "notice" : "message", item);
+    if (!delivery.success) {
+      console.error("session chat realtime delivery failed", { sessionId, itemId: item.id });
+    }
   } catch (error) {
-    // A notification must never prevent the participant from entering.
-    console.error("session join notice failed", error);
+    // Persistence is the source of truth, so a transient realtime failure must
+    // not undo a successful message or block a membership change.
+    console.error("session chat realtime delivery failed", error);
   } finally {
     void supabase.removeChannel(channel);
   }
+}
+
+/** Persist and broadcast a server-authored session timeline event. Structured
+ *  mention metadata keeps the profile link replayable without parsing content. */
+async function publishSessionEvent(
+  supabase: SupabaseClient,
+  sessionId: string,
+  userId: string,
+  kind: SessionSystemEvent,
+  actorId = userId,
+  customContent?: string,
+  eventMetadata: Pick<SessionChatMetadata, "role" | "previous_role" | "session_name"> = {},
+): Promise<void> {
+  const [{ data: profile }, { data: session }] = await Promise.all([
+    supabase
+      .from("profiles")
+      .select("username, display_name, emoji")
+      .eq("id", userId)
+      .maybeSingle(),
+    supabase
+      .from("pomodoro_sessions")
+      .select("status")
+      .eq("id", sessionId)
+      .maybeSingle(),
+  ]);
+  if (!session || !["waiting", "active"].includes(session.status as string)) return;
+
+  const username = profile?.username ?? "someone";
+  const action: Record<SessionSystemEvent, string> = {
+    participant_joined: "joined the session",
+    participant_left: "left the session",
+    participant_removed: "was removed from the session",
+    participant_promoted: "is now an admin",
+    participant_demoted: "is no longer an admin",
+    ownership_transferred: "is now the session owner",
+    session_renamed: "renamed the session",
+  };
+  const defaultContent = kind === "session_renamed" && eventMetadata.session_name
+    ? `@${username} renamed the session to ${eventMetadata.session_name}`
+    : `@${username} ${action[kind]}`;
+  const content = customContent ?? defaultContent;
+  const metadata: SessionChatMetadata = {
+    user_id: userId,
+    username,
+    display_name: profile?.display_name ?? username,
+    actor_id: actorId,
+    ...eventMetadata,
+  };
+
+  const { data, error } = await supabase
+    .from("chat_messages")
+    .insert({ session_id: sessionId, user_id: userId, content, kind, metadata })
+    .select("id, content, created_at, user_id, kind, metadata, profiles(username, display_name, emoji)")
+    .single();
+  if (error || !data) {
+    // Membership changes must remain available even if chat storage is
+    // temporarily unavailable or the migration has not reached an environment.
+    console.error("session timeline event could not be persisted", { sessionId, userId, kind, error });
+    return;
+  }
+
+  await broadcastSessionChatItem(supabase, sessionId, serializeSessionChatRow(data as unknown as SessionChatRow));
 }
 
 // ── Authorization guards ────────────────────────────────────────────────────────
@@ -225,7 +342,9 @@ router.get("/mine/active", authenticate, async (req, res) => {
 
 /** POST /api/sessions
  *  Create a new session.
- *  Body: { name: string, is_private?: boolean, password?: string, session_type?: 'pomodoro' | 'stopwatch' } */
+ *  Body: { name: string, is_private?: boolean, password?: string,
+ *    session_type?: 'pomodoro' | 'stopwatch',
+ *    starter_focus_minutes?: 15 | 25 | 35 | 45 | 55 } */
 router.post("/", authenticate, async (req, res) => {
   const { user, supabase, token } = req;
   const body = req.body;
@@ -252,7 +371,7 @@ router.post("/", authenticate, async (req, res) => {
   const passwordHash = rawPassword ? await bcrypt.hash(rawPassword, 10) : null;
 
   const sessionType = body.session_type === "stopwatch" ? "stopwatch" : "pomodoro";
-  const starterFocusMinutes = [15, 25, 35, 55].includes(body.starter_focus_minutes)
+  const starterFocusMinutes = [15, 25, 35, 45, 55].includes(body.starter_focus_minutes)
     ? Number(body.starter_focus_minutes)
     : null;
 
@@ -333,6 +452,7 @@ router.post("/", authenticate, async (req, res) => {
     cache.del(`timers:${data}`);
   }
 
+  await publishSessionEvent(supabase, String(data), user.id, "participant_joined");
   res.status(201).json({ data: { session_id: data, code } });
 });
 
@@ -368,17 +488,27 @@ router.post("/join", authenticate, async (req, res) => {
   const { data: sessionRow, error: lookupError } = await supabase
     .from("pomodoro_sessions").select("*").eq("code", code).single();
   if (lookupError) {
-    const status = lookupError.code === "PGRST116" ? 404 : 500;
-    res.status(status).json({ error: lookupError.code === "PGRST116" ? "Session not found" : lookupError.message }); return;
+    if (lookupError.code === "PGRST116") {
+      denyJoin(res, 404, "session_not_found", "No session exists with that code.", { code, userId: user.id });
+      return;
+    }
+    serverError(res, lookupError, `join:lookup:${code}`);
+    return;
   }
 
   const session = sessionRow as Record<string, unknown>;
-  if (session.status === "ended") { res.status(410).json({ error: "Session has ended" }); return; }
+  const joinLog = { code, sessionId: session.id as string, userId: user.id };
+
+  if (session.status === "ended") {
+    denyJoin(res, 410, "session_ended", "This session has already ended.", joinLog);
+    return;
+  }
 
   // One session at a time — re-entering the same session is always fine.
   const currentSessionId = await getActiveSessionId(supabase, user.id);
   if (currentSessionId && currentSessionId !== session.id) {
-    res.status(409).json({ error: ALREADY_IN_SESSION }); return;
+    denyJoin(res, 409, "already_in_session", ALREADY_IN_SESSION, joinLog);
+    return;
   }
 
   // Check if this user is already a participant (existing participants bypass password)
@@ -394,14 +524,24 @@ router.post("/join", authenticate, async (req, res) => {
     const hash = (session.password_hash as string | null) ?? null;
     if (hash) {
       const supplied = typeof body.password === "string" ? body.password : "";
-      const valid = await bcrypt.compare(supplied, hash);
-      if (!valid) {
-        // The caller is authenticated but is not authorized to enter this
-        // protected session. A 401 makes browser clients assume their login
-        // token expired and redirect to /login; 403 correctly preserves the
-        // password gate.
-        res.status(403).json({ error: "Incorrect password" }); return;
+      // "Nothing supplied" and "wrong password" are different situations for
+      // the UI: the first opens the password prompt, the second re-prompts with
+      // an error. Collapsing them into one message is why a private session
+      // used to fail with no explanation.
+      if (!supplied) {
+        denyJoin(res, 403, "password_required", "This session is private — it needs its password to join.", joinLog);
+        return;
       }
+      // A 401 here would make browser clients assume their login token expired
+      // and redirect to /login; 403 correctly preserves the password gate.
+      if (!(await bcrypt.compare(supplied, hash))) {
+        denyJoin(res, 403, "incorrect_password", "That session password is not correct.", joinLog);
+        return;
+      }
+    } else if (session.is_private === true) {
+      // Private with no password set: code-only access, nothing more to check.
+      // Recorded because it is the case that used to be rejected outright.
+      console.info("[join] private session, no password set — allowing by code", joinLog);
     }
   }
 
@@ -415,19 +555,47 @@ router.post("/join", authenticate, async (req, res) => {
   // so p_max_participants must not be passed.
   const ownerEnt = await getUserEntitlements(session.owner_id as string);
 
-  // Use a user-scoped client so auth.uid() resolves correctly inside the RPC
-  const userClient = createAuthClient(token);
-  const { error: joinError } = await userClient.rpc("join_pomo_session", {
+  const username = profile?.username ?? (user.email?.split("@")[0] ?? "User");
+  const capArg = BILLING_ENABLED ? { p_max_participants: ownerEnt.maxParticipants } : {};
+
+  // join_pomo_session_verified skips the RPC's blanket private-session refusal
+  // (see migration_private_session_join.sql) — every check it would have made
+  // has been made above, including the password. It is service-role only, so
+  // `supabase` (adminDb) must be the caller and the user id has to be explicit.
+  let { error: joinError } = await supabase.rpc("join_pomo_session_verified", {
     p_session_id: session.id as string,
-    p_username: profile?.username ?? (user.email?.split("@")[0] ?? "User"),
-    ...(BILLING_ENABLED ? { p_max_participants: ownerEnt.maxParticipants } : {}),
+    p_user_id: user.id,
+    p_username: username,
+    ...capArg,
   });
+
+  // Fall back to the original RPC where the migration has not been applied yet,
+  // so joining public sessions keeps working on an un-migrated database.
+  if (joinError && isMissingFunction(joinError)) {
+    console.warn("[join] join_pomo_session_verified missing — apply migration_private_session_join.sql", joinLog);
+    const userClient = createAuthClient(token);
+    ({ error: joinError } = await userClient.rpc("join_pomo_session", {
+      p_session_id: session.id as string,
+      p_username: username,
+      ...capArg,
+    }));
+  }
+
   if (joinError) {
     if (joinError.message.includes("Session is full")) {
-      res.status(409).json({ error: "session_full", max: ownerEnt.maxParticipants }); return;
+      console.warn("[join] denied: session_full", { ...joinLog, max: ownerEnt.maxParticipants });
+      res.status(409).json({ error: "session_full", code: "session_full", max: ownerEnt.maxParticipants });
+      return;
     }
-    res.status(400).json({ error: joinError.message }); return;
+    if (joinError.message.includes("This session is private")) {
+      denyJoin(res, 403, "session_private", "This session is private — ask the host for an invite.", joinLog);
+      return;
+    }
+    console.error("[join] rpc failed", { ...joinLog, error: joinError.message });
+    res.status(400).json({ error: joinError.message, code: "join_failed" });
+    return;
   }
+  console.info("[join] joined", { ...joinLog, rejoin: !!existingParticipant });
 
   const shouldJoinAsMember =
     session.owner_id !== user.id && (!existingParticipant || existingParticipant.left_at !== null);
@@ -458,7 +626,12 @@ router.post("/join", authenticate, async (req, res) => {
     participant = fetched ?? { role: "member", joined_at: new Date().toISOString() };
   }
   if (!existingParticipant || existingParticipant.left_at !== null) {
-    await broadcastSessionJoinNotice(supabase, session.id as string, user.id);
+    await publishSessionEvent(
+      supabase,
+      session.id as string,
+      user.id,
+      "participant_joined",
+    );
   }
   // Strip password_hash from session before returning
   const { password_hash: _ph, ...safeSession } = session as Record<string, unknown> & { password_hash?: unknown };
@@ -607,6 +780,10 @@ router.patch("/:id", authenticate, async (req, res) => {
   if (body.action) {
     switch (body.action) {
       case "start": {
+        const requestedIndex = typeof body.index === "number" ? body.index : session.current_timer_index;
+        // Treat a retried start as success instead of restarting an already
+        // running timer. Clients can safely retry after a lost response.
+        if (session.timer_state === "running" && requestedIndex === session.current_timer_index) break;
         const fields: Record<string, unknown> = {
           timer_state: "running",
           status: "active",
@@ -615,24 +792,30 @@ router.patch("/:id", authenticate, async (req, res) => {
         };
         if (typeof body.index === "number") fields.current_timer_index = body.index;
         const { error } = await supabase
-          .from("pomodoro_sessions").update(fields).eq("id", id).eq("timer_state", "idle");
+          .from("pomodoro_sessions").update(fields).eq("id", id);
         if (error) { serverError(res, error); return; }
         break;
       }
 
       case "pause": {
-        if (!session.timer_started_at) { res.status(400).json({ error: "Timer is not running" }); return; }
+        if (session.timer_state === "paused") break;
+        if (session.timer_state !== "running" || !session.timer_started_at) {
+          res.status(409).json({ error: "Timer state changed before it could be paused" }); return;
+        }
         const elapsed = (now.getTime() - new Date(session.timer_started_at).getTime()) / 1000;
         const { error } = await supabase
           .from("pomodoro_sessions")
           .update({ timer_state: "paused", paused_elapsed_seconds: elapsed })
-          .eq("id", id).eq("timer_state", "running");
+          .eq("id", id);
         if (error) { serverError(res, error); return; }
         break;
       }
 
       case "resume": {
-        if (session.paused_elapsed_seconds == null) { res.status(400).json({ error: "Timer is not paused" }); return; }
+        if (session.timer_state === "running") break;
+        if (session.timer_state !== "paused" || session.paused_elapsed_seconds == null) {
+          res.status(409).json({ error: "Timer state changed before it could be resumed" }); return;
+        }
         const { error } = await supabase
           .from("pomodoro_sessions")
           .update({
@@ -640,7 +823,7 @@ router.patch("/:id", authenticate, async (req, res) => {
             timer_started_at: new Date(now.getTime() - session.paused_elapsed_seconds * 1000).toISOString(),
             paused_elapsed_seconds: null,
           })
-          .eq("id", id).eq("timer_state", "paused");
+          .eq("id", id);
         if (error) { serverError(res, error); return; }
         break;
       }
@@ -662,7 +845,7 @@ router.patch("/:id", authenticate, async (req, res) => {
         };
         if (typeof body.index === "number") fields.current_timer_index = body.index;
         const { error } = await supabase
-          .from("pomodoro_sessions").update(fields).eq("id", id).neq("timer_state", "idle");
+          .from("pomodoro_sessions").update(fields).eq("id", id);
         if (error) { serverError(res, error); return; }
         break;
       }
@@ -747,7 +930,12 @@ router.patch("/:id", authenticate, async (req, res) => {
       }
     }
 
-    const { data: updated } = await supabase.from("pomodoro_sessions").select("*").eq("id", id).single();
+    const { data: updated, error: updatedError } = await supabase
+      .from("pomodoro_sessions")
+      .select("*")
+      .eq("id", id)
+      .single();
+    if (updatedError) { serverError(res, updatedError); return; }
     res.json({ data: { session: updated } });
     return;
   }
@@ -788,6 +976,17 @@ router.patch("/:id", authenticate, async (req, res) => {
     supportsLastActivityAt = true;
   }
   if (error) { serverError(res, error); return; }
+  if (typeof patch.name === "string" && patch.name !== session.name) {
+    await publishSessionEvent(
+      supabase,
+      String(id),
+      user.id,
+      "session_renamed",
+      user.id,
+      undefined,
+      { session_name: patch.name },
+    );
+  }
   // Never expose password_hash
   const { password_hash: _ph2, ...safeUpdated } = (updated ?? {}) as Record<string, unknown> & { password_hash?: unknown };
   void _ph2;
@@ -929,6 +1128,9 @@ router.post("/:id/laps", authenticate, async (req, res) => {
   if (typeof body?.duration_seconds !== "number" || body.duration_seconds < 0) {
     res.status(400).json({ error: "duration_seconds is required" }); return;
   }
+  if (typeof body.name === "string" && body.name.trim().length > LAP_NAME_MAX) {
+    res.status(400).json({ error: `Lap name must be ${LAP_NAME_MAX} characters or less` }); return;
+  }
 
   const { data: existing } = await supabase
     .from("stopwatch_laps").select("lap_number").eq("session_id", id).order("lap_number", { ascending: false }).limit(1);
@@ -953,6 +1155,9 @@ router.patch("/:id/laps/:lapId", authenticate, async (req, res) => {
   if (!(await requireManager(supabase, String(id), user.id, res))) return;
   if (typeof body?.name !== "string" || !body.name.trim()) {
     res.status(400).json({ error: "name is required" }); return;
+  }
+  if (body.name.trim().length > LAP_NAME_MAX) {
+    res.status(400).json({ error: `Lap name must be ${LAP_NAME_MAX} characters or less` }); return;
   }
   const { data, error } = await supabase
     .from("stopwatch_laps").update({ name: body.name.trim() }).eq("id", lapId).eq("session_id", id).select().single();
@@ -1066,7 +1271,9 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
   if (error) { serverError(res, error); return; }
 
   if (left_at === null && me.left_at !== null) {
-    await broadcastSessionJoinNotice(supabase, String(id), user.id);
+    await publishSessionEvent(supabase, String(id), user.id, "participant_joined");
+  } else if (left_at !== null && me.left_at === null) {
+    await publishSessionEvent(supabase, String(id), user.id, "participant_left");
   }
 
   if (left_at !== null) {
@@ -1182,6 +1389,18 @@ router.patch("/:id/participants/me", authenticate, async (req, res) => {
         .update({ role: "admin" })
         .eq("session_id", id)
         .eq("user_id", user.id);
+      await publishSessionEvent(
+        supabase,
+        String(id),
+        nextOwner.user_id,
+        "ownership_transferred",
+        user.id,
+        undefined,
+        {
+          role: "owner",
+          previous_role: nextOwner.role as "admin" | "member",
+        },
+      );
     }
   }
 
@@ -1205,7 +1424,8 @@ router.patch("/:id/participants/:participantId", authenticate, async (req, res) 
     .select("role")
     .eq("session_id", sessionId)
     .eq("user_id", user.id)
-    .single();
+    .is("left_at", null)
+    .maybeSingle();
 
   const myRole = me?.role;
   const isOwner = myRole === "owner";
@@ -1213,7 +1433,7 @@ router.patch("/:id/participants/:participantId", authenticate, async (req, res) 
   // Get target participant
   const { data: target } = await supabase
     .from("session_participants")
-    .select("role, user_id")
+    .select("role, user_id, left_at")
     .eq("id", participantId)
     .eq("session_id", sessionId)
     .single();
@@ -1222,11 +1442,33 @@ router.patch("/:id/participants/:participantId", authenticate, async (req, res) 
 
   if (body.role !== undefined) {
     if (!isOwner) { res.status(403).json({ error: "Only the owner can change roles" }); return; }
+    if (body.role !== "admin" && body.role !== "member") {
+      res.status(400).json({ error: "role must be 'admin' or 'member'" }); return;
+    }
+    if (target.left_at !== null) {
+      res.status(409).json({ error: "Cannot change the role of a participant who left" }); return;
+    }
     if (target.role === "owner") { res.status(403).json({ error: "Cannot change the owner's role" }); return; }
     if (target.user_id === user.id) { res.status(400).json({ error: "Cannot change your own role" }); return; }
+    if (target.role === body.role) {
+      res.json({ data: { participantId } });
+      return;
+    }
 
     const { error } = await supabase.from("session_participants").update({ role: body.role }).eq("id", participantId);
     if (error) { serverError(res, error); return; }
+    await publishSessionEvent(
+      supabase,
+      String(sessionId),
+      target.user_id,
+      body.role === "admin" ? "participant_promoted" : "participant_demoted",
+      user.id,
+      undefined,
+      {
+        role: body.role,
+        previous_role: target.role as "admin" | "member",
+      },
+    );
     res.json({ data: { participantId } });
     return;
   }
@@ -1241,6 +1483,15 @@ router.patch("/:id/participants/:participantId", authenticate, async (req, res) 
       .update({ left_at: body.left_at })
       .eq("id", participantId);
     if (error) { serverError(res, error); return; }
+    if (body.left_at !== null && target.left_at === null) {
+      await publishSessionEvent(
+        supabase,
+        String(sessionId),
+        target.user_id,
+        "participant_removed",
+        user.id,
+      );
+    }
     res.json({ data: { participantId } });
     return;
   }
@@ -1267,7 +1518,7 @@ router.post("/:id/participants/:userId/kick", authenticate, async (req, res) => 
 
   const { data: target } = await supabase
     .from("session_participants")
-    .select("role")
+    .select("role, left_at")
     .eq("session_id", id)
     .eq("user_id", userId)
     .single();
@@ -1282,25 +1533,57 @@ router.post("/:id/participants/:userId/kick", authenticate, async (req, res) => 
     .eq("user_id", userId);
 
   if (error) { serverError(res, error); return; }
+  if (target.left_at === null) {
+    await publishSessionEvent(
+      supabase,
+      String(id),
+      String(userId),
+      "participant_removed",
+      user.id,
+    );
+  }
   res.json({ data: { kicked: userId } });
 });
 
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 /** GET /api/sessions/:id/messages
- *  Session chat is ephemeral. This compatibility endpoint intentionally
- *  returns no history so older clients do not see previously persisted rows. */
+ *  Query params: limit (default 100, max 200), before (ISO timestamp).
+ *  The bounded newest-first index scan avoids loading an entire busy session. */
 router.get("/:id/messages", authenticate, async (req, res) => {
   const { user, supabase } = req;
   const { id } = req.params;
 
   if (!(await requireParticipant(supabase, String(id), user.id, res))) return;
-  res.json({ data: [] });
+
+  const limit = clampInt(req.query.limit, { min: 1, max: 200, fallback: 100 });
+  const before = typeof req.query.before === "string" ? req.query.before : undefined;
+  if (before && Number.isNaN(Date.parse(before))) {
+    res.status(400).json({ error: "before must be an ISO timestamp" }); return;
+  }
+
+  let query = supabase
+    .from("chat_messages")
+    .select("id, content, created_at, user_id, kind, metadata, profiles(username, display_name, emoji)")
+    .eq("session_id", id)
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false })
+    .limit(limit);
+  if (before) query = query.lt("created_at", before);
+
+  const { data, error } = await query;
+  if (error) { serverError(res, error); return; }
+
+  const messages = ((data ?? []) as unknown as SessionChatRow[])
+    .reverse()
+    .map(serializeSessionChatRow);
+  res.json({ data: messages });
 });
 
 /** POST /api/sessions/:id/messages
- *  Validate and relay an ephemeral message over Supabase Realtime Broadcast.
- *  No chat row is inserted; only clients already subscribed receive it. */
+ *  Persist for the lifetime of the session, then broadcast to active clients.
+ *  Session deletion cascades to these rows; ended sessions are cleared by the
+ *  database migration's status trigger. */
 router.post<{ id: string }>("/:id/messages", authenticate, messageLimiter, async (req, res) => {
   const { user, supabase } = req;
   const { id } = req.params;
@@ -1313,43 +1596,34 @@ router.post<{ id: string }>("/:id/messages", authenticate, messageLimiter, async
     res.status(400).json({ error: "Message cannot exceed 500 characters" }); return;
   }
 
-  // One query proves active membership and resolves the authoritative sender
-  // profile. Receivers never have to trust identity fields supplied by clients.
+  // One query proves active membership in a still-running session and resolves
+  // the authoritative sender profile. Identity is never accepted from clients.
   const { data: membership, error: membershipError } = await supabase
     .from("session_participants")
-    .select("profiles(username, display_name, emoji)")
+    .select("id, pomodoro_sessions!inner(status)")
     .eq("session_id", id)
     .eq("user_id", user.id)
     .is("left_at", null)
+    .in("pomodoro_sessions.status", ["waiting", "active"])
     .maybeSingle();
 
   if (membershipError) { serverError(res, membershipError); return; }
   if (!membership) { res.status(404).json({ error: "Session not found" }); return; }
 
-  const profile = (membership as unknown as {
-    profiles: { username: string; display_name: string; emoji: string } | null;
-  }).profiles;
-  const fallbackName = user.email?.split("@")[0] ?? "User";
-  const message = {
-    id: randomUUID(),
-    content: body.content.trim(),
-    created_at: new Date().toISOString(),
-    user_id: user.id,
-    profiles: profile ?? { username: fallbackName, display_name: fallbackName, emoji: "🍅" },
-  };
+  const { data, error } = await supabase
+    .from("chat_messages")
+    .insert({
+      session_id: id,
+      user_id: user.id,
+      content: body.content.trim(),
+      kind: "message" satisfies SessionChatKind,
+    })
+    .select("id, content, created_at, user_id, kind, metadata, profiles(username, display_name, emoji)")
+    .single();
+  if (error || !data) { serverError(res, error ?? new Error("Message was not saved")); return; }
 
-  const channel = supabase.channel(`session:${id}:chat`, { config: { private: true } });
-  try {
-    const delivery = await channel.httpSend("message", message);
-    if (!delivery.success) {
-      res.status(503).json({ error: "Message could not be delivered" }); return;
-    }
-  } catch (error) {
-    serverError(res, error); return;
-  } finally {
-    void supabase.removeChannel(channel);
-  }
-
+  const message = serializeSessionChatRow(data as unknown as SessionChatRow);
+  await broadcastSessionChatItem(supabase, String(id), message);
   res.status(201).json({ data: message });
 });
 
@@ -1427,7 +1701,7 @@ router.post("/:id/accept-invite", authenticate, async (req, res) => {
     participant = fetched ?? { role: "member", joined_at: new Date().toISOString() };
   }
   if (!existingParticipant || existingParticipant.left_at !== null) {
-    await broadcastSessionJoinNotice(supabase, String(id), user.id);
+    await publishSessionEvent(supabase, String(id), user.id, "participant_joined");
   }
   const { password_hash: _ph, ...safeSession } = sessionRow as Record<string, unknown> & { password_hash?: unknown };
   void _ph;

@@ -14,6 +14,10 @@ import { getSessionTimeMetrics } from "../lib/sessionTime";
 const router = Router();
 router.use(authenticate);
 
+// A single message body. Long enough for a real paragraph, bounded so one
+// message can never dominate a conversation view (or a push payload).
+const MESSAGE_MAX = 2000;
+
 // Per-user DM spam cap — mirrors the session-chat limiter (20 msgs / 10s).
 const dmMessageLimiter = perUserLimiter({
   windowMs: 10_000,
@@ -1076,6 +1080,9 @@ router.post<{ id: string }>("/conversations/:id/messages", dmMessageLimiter, asy
   const body = req.body;
   if (!body || typeof body.content !== "string" || !body.content.trim()) {
     res.status(400).json({ error: "content is required" }); return;
+  }
+  if (body.content.trim().length > MESSAGE_MAX) {
+    res.status(400).json({ error: `Message cannot exceed ${MESSAGE_MAX} characters` }); return;
   }
 
   const { data, error } = await supabase.rpc("post_dm_message", {

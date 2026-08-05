@@ -1,11 +1,24 @@
 import { Router } from "express";
+import bcrypt from "bcryptjs";
+import { randomInt } from "crypto";
 import { authenticate } from "../middleware/auth";
+import { perUserLimiter } from "../middleware/rateLimit";
+import { renderBrandedEmail, sendEmailDetailed } from "../lib/email";
 import { serverError } from "../lib/http";
 import { cache, TTL } from "../lib/cache";
 import { adminDb, createAnonClient } from "../lib/supabase";
 import { BILLING_ENABLED, getEntitlements, PLAN_COLUMNS, type PlanRow } from "../lib/plans";
 
 const router = Router();
+
+// Emailing a deletion code is expensive and irreversible-adjacent; a handful
+// per hour is far above any real use.
+const deletionLimiter = perUserLimiter({
+  windowMs: 60 * 60_000,
+  limit: 5,
+  message: "Too many deletion requests. Try again later.",
+  name: "account-deletion",
+});
 
 // Billing columns ride along on the profile so clients gate UI (paywalls,
 // locked tabs, trial countdown) from the one profile fetch they already do.
@@ -29,11 +42,11 @@ const PERSONALIZATION_CACHE_PREFIX = "personalization:";
 const FOCUS_CATEGORIES = ["study", "work", "build", "read", "other"] as const;
 const FOCUS_GOALS = ["finish", "deadline", "habit", "progress", "structure"] as const;
 const FOCUS_STYLES = ["solo", "friends", "team"] as const;
-const FOCUS_PEAKS = ["morning", "afternoon", "evening", "night"] as const;
-const FOCUS_OBSTACLES = ["procrastination", "distractions", "consistency", "burnout"] as const;
-const MOTIVATION_STYLES = ["progress", "streaks", "accountability", "gentle"] as const;
-const WEEKLY_TARGETS = [2, 3, 5, 7] as const;
-const FOCUS_MINUTES = [15, 25, 35, 55] as const;
+const FOCUS_PEAKS = ["morning", "afternoon", "evening", "night", "varies"] as const;
+const FOCUS_OBSTACLES = ["procrastination", "distractions", "consistency", "burnout", "overwhelm"] as const;
+const MOTIVATION_STYLES = ["progress", "streaks", "accountability", "gentle", "challenge"] as const;
+const WEEKLY_TARGETS = [2, 3, 4, 5, 7] as const;
+const FOCUS_MINUTES = [15, 25, 35, 45, 55] as const;
 
 function oneOf<T extends readonly unknown[]>(value: unknown, values: T): value is T[number] {
   return values.includes(value as never);
@@ -453,8 +466,115 @@ router.post("/email", authenticate, async (req, res) => {
  *  auth user, otherwise the ON DELETE CASCADE on session_participants would orphan
  *  a live session with no owner. Then delete the auth user, which cascades to the
  *  profile and all user-owned rows. */
+// ── Account deletion ─────────────────────────────────────────────────────────
+
+/** How long an emailed deletion code stays valid. */
+const DELETION_CODE_TTL_MS = 15 * 60_000;
+/** Wrong guesses allowed before the code is burned and must be re-requested. */
+const DELETION_CODE_MAX_ATTEMPTS = 5;
+/** Grace period before purge_deleted_accounts() removes the data for good. */
+const DELETION_GRACE_DAYS = 30;
+
+/** POST /api/profile/delete/request — email a confirmation code.
+ *  Deleting an account is irreversible after the grace period, so it takes
+ *  possession of the account's inbox, not just a logged-in session. */
+router.post("/delete/request", authenticate, deletionLimiter, async (req, res) => {
+  const { user } = req;
+  if (!user.email) {
+    res.status(400).json({ error: "This account has no email address to confirm with." });
+    return;
+  }
+
+  const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+  const expiresAt = new Date(Date.now() + DELETION_CODE_TTL_MS);
+  const { error: storeError } = await adminDb.from("account_deletion_requests").upsert({
+    user_id: user.id,
+    code_hash: await bcrypt.hash(code, 10),
+    attempts: 0,
+    expires_at: expiresAt.toISOString(),
+    created_at: new Date().toISOString(),
+  }, { onConflict: "user_id" });
+  if (storeError) { serverError(res, storeError, "delete-request"); return; }
+
+  const sent = await sendEmailDetailed({
+    to: user.email,
+    subject: "Confirm deleting your BetterPomo account",
+    text:
+      `Your BetterPomo account deletion code is ${code}. It expires in 15 minutes.\n\n`
+      + `If you did not request this, ignore this email and change your password — `
+      + `your account stays exactly as it is.`,
+    html: renderBrandedEmail({
+      preview: "Confirm deleting your BetterPomo account",
+      eyebrow: "ACCOUNT DELETION",
+      heading: "Confirm you want to delete your account",
+      code,
+      paragraphs: [
+        "Enter this code in the app to confirm. It expires in 15 minutes.",
+        `Your account and history are recoverable for ${DELETION_GRACE_DAYS} days after deletion — contact support within that window and we can restore it.`,
+      ],
+      notice: "Didn't request this? Ignore this email and change your password. Nothing has been deleted.",
+    }),
+    tags: [{ name: "type", value: "account-deletion" }],
+  });
+
+  if (!sent.ok) {
+    console.error("[delete] confirmation email failed", { userId: user.id, error: sent.error });
+    res.status(502).json({ error: "Could not send the confirmation email. Please try again." });
+    return;
+  }
+
+  console.info("[delete] confirmation code sent", { userId: user.id });
+  res.json({ data: { sent: true, expires_at: expiresAt.toISOString() } });
+});
+
+/** Verify (and consume an attempt of) the emailed deletion code. */
+async function deletionCodeValid(userId: string, supplied: unknown): Promise<
+  { ok: true } | { ok: false; status: number; error: string }
+> {
+  if (typeof supplied !== "string" || !supplied.trim()) {
+    return { ok: false, status: 400, error: "Enter the confirmation code from your email." };
+  }
+  const { data: request } = await adminDb
+    .from("account_deletion_requests")
+    .select("code_hash, attempts, expires_at")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (!request) {
+    return { ok: false, status: 400, error: "Request a confirmation code first." };
+  }
+  const row = request as { code_hash: string; attempts: number; expires_at: string };
+  if (new Date(row.expires_at).getTime() < Date.now()) {
+    await adminDb.from("account_deletion_requests").delete().eq("user_id", userId);
+    return { ok: false, status: 400, error: "That code has expired. Request a new one." };
+  }
+  if (row.attempts >= DELETION_CODE_MAX_ATTEMPTS) {
+    await adminDb.from("account_deletion_requests").delete().eq("user_id", userId);
+    return { ok: false, status: 429, error: "Too many incorrect codes. Request a new one." };
+  }
+  if (!(await bcrypt.compare(supplied.trim(), row.code_hash))) {
+    await adminDb
+      .from("account_deletion_requests")
+      .update({ attempts: row.attempts + 1 })
+      .eq("user_id", userId);
+    return { ok: false, status: 400, error: "That code is not correct." };
+  }
+  return { ok: true };
+}
+
+/** DELETE /api/profile — soft-delete the account. Body: { code }
+ *  The row is marked and hidden, then hard-deleted by the scheduled purge
+ *  DELETION_GRACE_DAYS later (migration_soft_delete_accounts.sql), so an
+ *  accidental deletion can still be undone with restore_deleted_account(). */
 router.delete("/", authenticate, async (req, res) => {
   const { user } = req;
+
+  const codeCheck = await deletionCodeValid(user.id, (req.body ?? {}).code);
+  if (!codeCheck.ok) {
+    console.warn("[delete] rejected", { userId: user.id, reason: codeCheck.error });
+    res.status(codeCheck.status).json({ error: codeCheck.error });
+    return;
+  }
 
   // 1. Reassign or tear down active sessions this user owns.
   const { data: ownedActive } = await adminDb
@@ -522,13 +642,30 @@ router.delete("/", authenticate, async (req, res) => {
     if (transferError) { serverError(res, transferError); return; }
   }
 
-  // 3. Delete the auth user (cascades to profile + dependent rows via FK).
-  const { error } = await adminDb.auth.admin.deleteUser(user.id);
+  // 3. Mark the account deleted rather than destroying it. Reads filter on
+  //    deleted_at, and purge_deleted_accounts() removes it for good after the
+  //    grace period — until then restore_deleted_account() can undo this.
+  const deletedAt = new Date().toISOString();
+  const { error } = await adminDb
+    .from("profiles")
+    .update({ deleted_at: deletedAt })
+    .eq("id", user.id);
   if (error) {
-    console.error("Account deletion failed:", error);
+    console.error("[delete] soft delete failed", { userId: user.id, error });
     res.status(500).json({ error: "Could not delete account" });
     return;
   }
+
+  // Ban the auth user so the account cannot be signed into during the grace
+  // period. restore_deleted_account() lifts this again.
+  const { error: banError } = await adminDb.auth.admin.updateUserById(user.id, {
+    ban_duration: `${DELETION_GRACE_DAYS * 24}h`,
+  });
+  if (banError) console.error("[delete] could not ban signed-out account", { userId: user.id, error: banError });
+
+  await adminDb.from("account_deletion_requests").delete().eq("user_id", user.id);
+  const purgeAt = new Date(Date.now() + DELETION_GRACE_DAYS * 86_400_000).toISOString();
+  console.info("[delete] account soft-deleted", { userId: user.id, deletedAt, purgeAt });
 
   // 4. Drop every cache entry that referenced this user.
   cache.del(`profile:${user.id}`);
@@ -547,7 +684,7 @@ router.delete("/", authenticate, async (req, res) => {
   cache.delByPrefix("user-hist:");
   cache.delByPrefix("user-friends:");
 
-  res.json({ data: { deleted: true } });
+  res.json({ data: { deleted: true, restorable_until: purgeAt } });
 });
 
 export default router;

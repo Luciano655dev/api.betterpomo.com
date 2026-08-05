@@ -3,10 +3,16 @@ import { authenticate } from "../middleware/auth";
 import { serverError } from "../lib/http";
 import { cache, TTL } from "../lib/cache";
 import { clampInt } from "../lib/utils";
-import { getUserEntitlements, upgradeRequired } from "../lib/plans";
+import { getUserEntitlements, TIMERS_HARD_CAP, upgradeRequired } from "../lib/plans";
 import { getSessionTimeMetrics } from "../lib/sessionTime";
 
 const router = Router();
+
+// A saved history row is a snapshot, not live data — these bound what one row
+// can hold so a crafted client cannot store megabytes per session.
+const MAX_TIMER_SECONDS = 24 * 60 * 60;
+const MAX_HISTORY_PARTICIPANTS = 50;
+const MAX_SESSION_NAME_LENGTH = 100;
 
 /** Free-plan cutoff: entries older than this many days are hidden (kept in the
  *  DB — they unlock instantly on upgrade). Null historyDays = no cutoff. */
@@ -225,6 +231,28 @@ router.post("/", authenticate, async (req, res) => {
   // count (per plan — clamped silently, a history save must never fail) + text
   // length, and only the two expected fields survive.
   const ent = await getUserEntitlements(user.id);
+
+  // timers_used / participants are client-supplied snapshots that used to be
+  // written through verbatim — an unbounded array of unbounded strings on every
+  // save. Clamp both to the same shape the app actually renders.
+  const timersUsed = Array.isArray(body.timers_used)
+    ? (body.timers_used as unknown[])
+        .filter((t): t is { name: string; duration: unknown } =>
+          !!t && typeof t === "object" && typeof (t as { name?: unknown }).name === "string")
+        .slice(0, TIMERS_HARD_CAP)
+        .map((t) => ({
+          name: t.name.trim().slice(0, 80),
+          duration: Math.min(Math.max(Math.floor(Number(t.duration) || 0), 0), MAX_TIMER_SECONDS),
+        }))
+    : [];
+
+  const participantNames = Array.isArray(body.participants)
+    ? (body.participants as unknown[])
+        .filter((v): v is string => typeof v === "string" && !!v.trim())
+        .slice(0, MAX_HISTORY_PARTICIPANTS)
+        .map((v) => v.trim().slice(0, 50))
+    : [];
+
   const tasks = Array.isArray(body.tasks)
     ? (body.tasks as unknown[])
         .filter((t): t is { text: string; done?: boolean } =>
@@ -299,8 +327,8 @@ router.post("/", authenticate, async (req, res) => {
         .from("pomodoro_history")
         .update({
           session_name: body.session_name.trim(),
-          timers_used: body.timers_used ?? [],
-          participants: body.participants ?? [],
+          timers_used: timersUsed,
+          participants: participantNames,
           duration_seconds: durationSeconds,
           ...(focusSeconds !== undefined ? { focus_seconds: focusSeconds } : {}),
           tasks,
@@ -326,8 +354,8 @@ router.post("/", authenticate, async (req, res) => {
     source_session_id: sourceSessionId,
     session_name: body.session_name.trim(),
     was_private: wasPrivate,
-    timers_used: body.timers_used ?? [],
-    participants: body.participants ?? [],
+    timers_used: timersUsed,
+    participants: participantNames,
     duration_seconds: durationSeconds,
     ...(focusSeconds !== undefined ? { focus_seconds: focusSeconds } : {}),
     tasks,
@@ -394,7 +422,16 @@ router.patch("/:id", authenticate, async (req, res) => {
   if (!body) { res.status(400).json({ error: "Request body required" }); return; }
 
   const patch: Record<string, unknown> = {};
-  if (typeof body.session_name === "string" && body.session_name.trim()) patch.session_name = body.session_name.trim();
+  if (body.session_name !== undefined) {
+    if (typeof body.session_name !== "string" || !body.session_name.trim()) {
+      res.status(400).json({ error: "session_name must be a non-empty string" }); return;
+    }
+    const sessionName = body.session_name.trim();
+    if (sessionName.length > MAX_SESSION_NAME_LENGTH) {
+      res.status(400).json({ error: `session_name must be ${MAX_SESSION_NAME_LENGTH} characters or less` }); return;
+    }
+    patch.session_name = sessionName;
+  }
   if (typeof body.duration_seconds === "number" && body.duration_seconds >= 0) {
     const nextDuration = Math.floor(body.duration_seconds);
     patch.duration_seconds = nextDuration;
