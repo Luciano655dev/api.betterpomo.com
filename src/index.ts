@@ -18,6 +18,7 @@ import emailRouter from "./routes/email";
 import billingRouter, { stripeWebhookHandler } from "./routes/billing";
 import templatesRouter from "./routes/templates";
 import statusRouter from "./routes/status";
+import moderationRouter from "./routes/moderation";
 import { authEmailHookHandler } from "./routes/authEmailHook";
 import { startEmailScheduler } from "./lib/emailScheduler";
 import { startTrialReminderSweep } from "./lib/trialReminders";
@@ -155,6 +156,7 @@ app.use("/api/feedback", feedbackRouter);
 app.use("/api/email", emailRouter);
 app.use("/api/billing", billingRouter);
 app.use("/api/templates", templatesRouter);
+app.use("/api/moderation", moderationRouter);
 
 // Account creation, resend and recovery all send email. Keep their shared
 // budget tight while allowing enough code attempts for normal typing mistakes.

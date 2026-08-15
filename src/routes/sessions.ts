@@ -8,6 +8,8 @@ import { clampInt, generateSessionCode, escapeLike } from "../lib/utils";
 import { cache, TTL } from "../lib/cache";
 import { createAuthClient } from "../lib/supabase";
 import { getSessionTimeMetrics } from "../lib/sessionTime";
+import { getMutuallyBlockedUserIds, usersHaveBlockedEachOther } from "../lib/blocks";
+import { rejectObjectionableText } from "../lib/moderation";
 import {
   BILLING_ENABLED,
   getEntitlements,
@@ -354,6 +356,7 @@ router.post("/", authenticate, async (req, res) => {
   if (body.name.trim().length > 100) {
     res.status(400).json({ error: "Session name must be 100 characters or less" }); return;
   }
+  if (rejectObjectionableText(res, [body.name])) return;
 
   // One session at a time — leave the current one before creating another.
   if (await getActiveSessionId(supabase, user.id)) {
@@ -498,6 +501,12 @@ router.post("/join", authenticate, async (req, res) => {
 
   const session = sessionRow as Record<string, unknown>;
   const joinLog = { code, sessionId: session.id as string, userId: user.id };
+
+  if (typeof session.created_by === "string"
+      && await usersHaveBlockedEachOther(supabase, user.id, session.created_by)) {
+    denyJoin(res, 404, "session_not_found", "No session exists with that code.", joinLog);
+    return;
+  }
 
   if (session.status === "ended") {
     denyJoin(res, 410, "session_ended", "This session has already ended.", joinLog);
@@ -944,6 +953,7 @@ router.patch("/:id", authenticate, async (req, res) => {
   if (typeof body.name === "string" && body.name.trim().length > 100) {
     res.status(400).json({ error: "Session name must be 100 characters or less" }); return;
   }
+  if (typeof body.name === "string" && rejectObjectionableText(res, [body.name])) return;
   const patch: Record<string, unknown> = {};
   if (typeof body.name === "string" && body.name.trim()) patch.name = body.name.trim();
   if (typeof body.is_private === "boolean") patch.is_private = body.is_private;
@@ -1024,6 +1034,7 @@ router.post("/:id/timers", authenticate, async (req, res) => {
   if (body.name.trim().length > 80) {
     res.status(400).json({ error: "Timer name must be 80 characters or less" }); return;
   }
+  if (rejectObjectionableText(res, [body.name])) return;
   if (typeof body.duration !== "number" || body.duration <= 0) {
     res.status(400).json({ error: "duration must be a positive number of seconds" }); return;
   }
@@ -1069,6 +1080,7 @@ router.patch("/:id/timers/:timerId", authenticate, async (req, res) => {
   if (typeof body.name === "string" && body.name.trim().length > 80) {
     res.status(400).json({ error: "Timer name must be 80 characters or less" }); return;
   }
+  if (typeof body.name === "string" && rejectObjectionableText(res, [body.name])) return;
   const patch: Record<string, unknown> = {};
   if (typeof body.name === "string" && body.name.trim()) patch.name = body.name.trim();
   if (typeof body.duration === "number" && body.duration > 0) patch.duration = Math.min(Math.floor(body.duration), 86400);
@@ -1131,6 +1143,7 @@ router.post("/:id/laps", authenticate, async (req, res) => {
   if (typeof body.name === "string" && body.name.trim().length > LAP_NAME_MAX) {
     res.status(400).json({ error: `Lap name must be ${LAP_NAME_MAX} characters or less` }); return;
   }
+  if (typeof body.name === "string" && rejectObjectionableText(res, [body.name])) return;
 
   const { data: existing } = await supabase
     .from("stopwatch_laps").select("lap_number").eq("session_id", id).order("lap_number", { ascending: false }).limit(1);
@@ -1159,6 +1172,7 @@ router.patch("/:id/laps/:lapId", authenticate, async (req, res) => {
   if (body.name.trim().length > LAP_NAME_MAX) {
     res.status(400).json({ error: `Lap name must be ${LAP_NAME_MAX} characters or less` }); return;
   }
+  if (rejectObjectionableText(res, [body.name])) return;
   const { data, error } = await supabase
     .from("stopwatch_laps").update({ name: body.name.trim() }).eq("id", lapId).eq("session_id", id).select().single();
   if (error) {
@@ -1574,7 +1588,9 @@ router.get("/:id/messages", authenticate, async (req, res) => {
   const { data, error } = await query;
   if (error) { serverError(res, error); return; }
 
+  const blockedIds = await getMutuallyBlockedUserIds(supabase, user.id);
   const messages = ((data ?? []) as unknown as SessionChatRow[])
+    .filter((message) => !message.user_id || !blockedIds.has(message.user_id))
     .reverse()
     .map(serializeSessionChatRow);
   res.json({ data: messages });
@@ -1595,6 +1611,7 @@ router.post<{ id: string }>("/:id/messages", authenticate, messageLimiter, async
   if (body.content.length > 500) {
     res.status(400).json({ error: "Message cannot exceed 500 characters" }); return;
   }
+  if (rejectObjectionableText(res, [body.content])) return;
 
   // One query proves active membership in a still-running session and resolves
   // the authoritative sender profile. Identity is never accepted from clients.

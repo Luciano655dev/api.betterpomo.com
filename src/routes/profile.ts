@@ -8,6 +8,7 @@ import { serverError } from "../lib/http";
 import { cache, TTL } from "../lib/cache";
 import { adminDb, createAnonClient } from "../lib/supabase";
 import { BILLING_ENABLED, getEntitlements, PLAN_COLUMNS, type PlanRow } from "../lib/plans";
+import { rejectObjectionableText } from "../lib/moderation";
 
 const router = Router();
 
@@ -262,6 +263,7 @@ router.patch("/", authenticate, async (req, res) => {
   if (body.display_name !== undefined && normalizedDisplayName(body.display_name) === null) {
     res.status(400).json({ error: "Display name must be 1-50 characters" }); return;
   }
+  if (rejectObjectionableText(res, [body.username, body.display_name, body.bio])) return;
   const patch: Record<string, unknown> = {};
   if (typeof body.username === "string" && body.username.trim()) patch.username = body.username.trim().toLowerCase();
   if (body.display_name !== undefined) patch.display_name = normalizedDisplayName(body.display_name);
@@ -306,6 +308,7 @@ router.post("/initialize-oauth-identity", authenticate, async (req, res) => {
   const { user, supabase } = req;
   const providerName = normalizedDisplayName(req.body?.provider_name);
   if (!providerName) { res.status(400).json({ error: "A valid provider_name is required" }); return; }
+  if (rejectObjectionableText(res, [providerName])) return;
   if (!(user.identities ?? []).some((identity) => identity.provider === "apple" || identity.provider === "google")) {
     res.status(403).json({ error: "OAuth identity required" }); return;
   }

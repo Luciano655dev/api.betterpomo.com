@@ -2,6 +2,7 @@ import { Router } from "express";
 import { authenticate } from "../middleware/auth";
 import { serverError } from "../lib/http";
 import { cache, TTL } from "../lib/cache";
+import { rejectObjectionableText } from "../lib/moderation";
 
 const router = Router();
 router.use(authenticate);
@@ -89,6 +90,7 @@ router.post("/", async (req, res) => {
   if (!title) { res.status(400).json({ error: "Title is required" }); return; }
   if (title.length > 120) { res.status(400).json({ error: "Title must be 120 characters or less" }); return; }
   if (details.length > 2000) { res.status(400).json({ error: "Details must be 2000 characters or less" }); return; }
+  if (rejectObjectionableText(res, [title, details])) return;
 
   const { data, error } = await req.supabase!
     .from("feedback_posts")

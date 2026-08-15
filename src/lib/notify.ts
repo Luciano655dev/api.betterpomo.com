@@ -1,6 +1,7 @@
 import { adminDb } from "./supabase";
 import { cache } from "./cache";
 import { queuePush, type PushCategory, type PushPayload } from "./push";
+import { usersHaveBlockedEachOther } from "./blocks";
 
 export type NotificationType =
   | "friend_request"
@@ -77,6 +78,7 @@ function copyFor(opts: NotifyOptions): { category: PushCategory; payload: PushPa
 export async function notify(recipientId: string, opts: NotifyOptions): Promise<void> {
   try {
     if (!recipientId || recipientId === opts.actorId) return;
+    if (opts.actorId && await usersHaveBlockedEachOther(adminDb, recipientId, opts.actorId)) return;
     const { data: inserted, error } = await adminDb.from("notifications").insert({
       user_id: recipientId,
       actor_id: opts.actorId,

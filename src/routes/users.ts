@@ -5,6 +5,7 @@ import { serverError } from "../lib/http";
 import { cache, TTL } from "../lib/cache";
 import { clampInt, escapeLike } from "../lib/utils";
 import { BILLING_ENABLED, getEntitlements, getUserEntitlements, type PlanRow } from "../lib/plans";
+import { getMutuallyBlockedUserIds, usersHaveBlockedEachOther } from "../lib/blocks";
 
 const router = Router();
 router.use(authenticate);
@@ -57,7 +58,7 @@ router.get("/search", async (req, res) => {
   const from = (page - 1) * limit;
   const to = from + limit - 1;
 
-  const cacheKey = `search:${q}:${page}:${limit}`;
+  const cacheKey = `search:${req.user.id}:${q}:${page}:${limit}`;
   const hit = cache.get(cacheKey);
   if (hit) { res.json({ data: hit }); return; }
 
@@ -73,6 +74,9 @@ router.get("/search", async (req, res) => {
     const escaped = escapeLike(q).replace(/[(),]/g, "");
     query = query.or(`username.ilike.%${escaped}%,display_name.ilike.%${escaped}%`);
   }
+
+  const blockedIds = await getMutuallyBlockedUserIds(req.supabase, req.user.id);
+  if (blockedIds.size > 0) query = query.not("id", "in", `(${[...blockedIds].join(",")})`);
 
   const { data, count, error } = await query;
 
@@ -131,6 +135,9 @@ router.get("/:username/history", async (req, res) => {
   if (profileError) { serverError(res, profileError); return; }
   const profile = resolved as { id: string; is_private: boolean } | null;
   if (!profile) { res.status(404).json({ error: "User not found" }); return; }
+  if (profile.id !== req.user.id && await usersHaveBlockedEachOther(req.supabase, req.user.id, profile.id)) {
+    res.json({ data: [] }); return;
+  }
 
   // The gated result differs by viewer (owner sees full history, others see []
   // for a private account), so the cache key carries an own/pub discriminator —
@@ -188,6 +195,9 @@ router.get("/:username/friends", async (req, res) => {
   if (profileError) { serverError(res, profileError); return; }
   const profile = resolved as { id: string; is_private: boolean } | null;
   if (!profile) { res.status(404).json({ error: "User not found" }); return; }
+  if (profile.id !== req.user.id && await usersHaveBlockedEachOther(req.supabase, req.user.id, profile.id)) {
+    res.json({ data: { count: 0, friends: [] } }); return;
+  }
 
   const cacheKey = `user-friends:${profile.id}:${req.user.id === profile.id ? "own" : "pub"}`;
   const hit = cache.get(cacheKey);
@@ -224,6 +234,9 @@ router.get("/:username/active-session", async (req, res) => {
   if (profileError) { serverError(res, profileError); return; }
   const profile = resolved as { id: string; is_private: boolean } | null;
   if (!profile) { res.status(404).json({ error: "User not found" }); return; }
+  if (profile.id !== req.user.id && await usersHaveBlockedEachOther(req.supabase, req.user.id, profile.id)) {
+    res.json({ data: { in_session: false, session_name: null } }); return;
+  }
 
   // Generic session presence is visible to every authenticated user, including
   // non-friends and private profiles. Identity/join details remain protected by

@@ -10,6 +10,8 @@ import { clampInt } from "../lib/utils";
 import { getUserEntitlements, upgradeRequired } from "../lib/plans";
 import { cancelCoalescedPush, queueCoalescedPush } from "../lib/push";
 import { getSessionTimeMetrics } from "../lib/sessionTime";
+import { getMutuallyBlockedUserIds, usersHaveBlockedEachOther } from "../lib/blocks";
+import { rejectObjectionableText } from "../lib/moderation";
 
 const router = Router();
 router.use(authenticate);
@@ -211,7 +213,11 @@ async function pushNewMessage(
       actorSnapshot(supabase, senderId),
     ]);
     if (membersError) throw membersError;
-    const recipients = (members ?? []).map((member) => member.user_id).filter((id) => id !== senderId);
+    const candidateRecipients = (members ?? []).map((member) => member.user_id).filter((id) => id !== senderId);
+    const recipients: string[] = [];
+    for (const recipientId of candidateRecipients) {
+      if (!(await usersHaveBlockedEachOther(supabase, senderId, recipientId))) recipients.push(recipientId);
+    }
     const groupTitle = conversation?.title?.trim() || "your group";
     const preview = content.replace(/\s+/g, " ").trim().slice(0, 160);
     await Promise.all(recipients.map((recipientId) => queueCoalescedPush(
@@ -264,8 +270,16 @@ router.get("/conversations", async (req, res) => {
 
   const { data, error } = await supabase.rpc("list_conversations", { p_user_id: user.id });
   if (error) { serverError(res, error); return; }
-  cache.set(cacheKey, data ?? [], TTL.CONVERSATIONS);
-  res.json({ data: data ?? [] });
+  let blockedIds: Set<string>;
+  try {
+    blockedIds = await getMutuallyBlockedUserIds(supabase, user.id);
+  } catch (blockError) {
+    serverError(res, blockError); return;
+  }
+  const visible = ((data ?? []) as Array<{ is_group: boolean; members?: Array<{ id: string }> }>)
+    .filter((conversation) => conversation.is_group || !(conversation.members ?? []).some((member) => blockedIds.has(member.id)));
+  cache.set(cacheKey, visible, TTL.CONVERSATIONS);
+  res.json({ data: visible });
 });
 
 /** POST /api/chat/conversations/direct — open (or reuse) a 1:1 chat. Body: { username } */
@@ -277,6 +291,9 @@ router.post("/conversations/direct", async (req, res) => {
   }
   const friendId = await resolveUserId(supabase, body.username.trim());
   if (!friendId) { res.status(404).json({ error: "User not found" }); return; }
+  if (await usersHaveBlockedEachOther(supabase, user.id, friendId)) {
+    res.status(403).json({ error: "Interaction unavailable" }); return;
+  }
 
   const { data, error } = await supabase.rpc("get_or_create_direct_conversation", {
     p_actor: user.id,
@@ -299,11 +316,21 @@ router.post("/conversations/group", async (req, res) => {
   if (!title || title.length > 80) {
     res.status(400).json({ error: "Group name must be 1-80 characters" }); return;
   }
+  if (rejectObjectionableText(res, [title])) return;
   const timezone = validTimezone(body.timezone) ? body.timezone : "UTC";
   const emoji = validGroupEmoji(body.emoji) ? body.emoji.trim() : "👥";
-  const usernames = Array.isArray(body.usernames)
-    ? [...new Set(body.usernames.filter((value: unknown): value is string => typeof value === "string" && !!value.trim()).map((value: string) => value.trim()))]
+  const usernames: string[] = Array.isArray(body.usernames)
+    ? [...new Set((body.usernames as unknown[])
+        .filter((value): value is string => typeof value === "string" && !!value.trim())
+        .map((value) => value.trim()))]
     : [];
+
+  for (const invitedUsername of usernames) {
+    const invitedId = await resolveUserId(supabase, invitedUsername);
+    if (invitedId && await usersHaveBlockedEachOther(supabase, user.id, invitedId)) {
+      res.status(403).json({ error: "One or more invitations are unavailable" }); return;
+    }
+  }
 
   const ent = await getUserEntitlements(user.id);
   if (usernames.length + 1 > ent.maxGroupMembers) { upgradeRequired(res, "group_chat_size"); return; }
@@ -349,6 +376,9 @@ router.post("/conversations/:id/members", async (req, res) => {
   const inviteeId = await resolveUserId(supabase, body.username.trim());
   if (!inviteeId) { res.status(404).json({ error: "User not found" }); return; }
   if (inviteeId === user.id) { res.status(400).json({ error: "You are already in this group" }); return; }
+  if (await usersHaveBlockedEachOther(supabase, user.id, inviteeId)) {
+    res.status(403).json({ error: "Interaction unavailable" }); return;
+  }
 
   const access = await getGroupAccess(supabase, String(id), user.id);
   if (!access) { res.status(404).json({ error: "Group not found" }); return; }
@@ -671,6 +701,7 @@ router.patch("/conversations/:id", async (req, res) => {
   if (req.body?.title !== undefined) {
     const title = typeof req.body.title === "string" ? req.body.title.trim() : "";
     if (!title || title.length > 80) { res.status(400).json({ error: "Group name must be 1-80 characters" }); return; }
+    if (rejectObjectionableText(res, [title])) return;
     patch.title = title;
   }
   if (req.body?.timezone !== undefined) {
@@ -1070,7 +1101,13 @@ router.get("/conversations/:id/messages", async (req, res) => {
     p_before: before,
   });
   if (error) { res.status(400).json({ error: error.message }); return; }
-  res.json({ data: data ?? [] });
+  let blockedIds: Set<string>;
+  try {
+    blockedIds = await getMutuallyBlockedUserIds(supabase, user.id);
+  } catch (blockError) {
+    serverError(res, blockError); return;
+  }
+  res.json({ data: (data ?? []).filter((message: { sender_id: string }) => !blockedIds.has(message.sender_id)) });
 });
 
 /** POST /api/chat/conversations/:id/messages — send a text message. Body: { content } */
@@ -1084,6 +1121,7 @@ router.post<{ id: string }>("/conversations/:id/messages", dmMessageLimiter, asy
   if (body.content.trim().length > MESSAGE_MAX) {
     res.status(400).json({ error: `Message cannot exceed ${MESSAGE_MAX} characters` }); return;
   }
+  if (rejectObjectionableText(res, [body.content])) return;
 
   const { data, error } = await supabase.rpc("post_dm_message", {
     p_actor: user.id,
@@ -1149,10 +1187,14 @@ router.post("/conversations/:id/invite", async (req, res) => {
     .select("user_id")
     .eq("conversation_id", id);
   const others = (members ?? []).map((m) => m.user_id).filter((uid) => uid !== user.id);
-  if (others.length === 0) { res.status(400).json({ error: "No one to invite" }); return; }
+  const allowedOthers: string[] = [];
+  for (const inviteeId of others) {
+    if (!(await usersHaveBlockedEachOther(supabase, user.id, inviteeId))) allowedOthers.push(inviteeId);
+  }
+  if (allowedOthers.length === 0) { res.status(400).json({ error: "No one available to invite" }); return; }
 
   const actor = await actorSnapshot(supabase, user.id);
-  for (const invitee of others) {
+  for (const invitee of allowedOthers) {
     const { error } = await supabase.rpc("create_session_invite", {
       p_actor: user.id,
       p_session_id: session.id,

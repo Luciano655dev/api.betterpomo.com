@@ -2,6 +2,7 @@ import { Router } from "express";
 import { adminDb, createAnonClient } from "../lib/supabase";
 import { serverError } from "../lib/http";
 import { escapeLike } from "../lib/utils";
+import { rejectObjectionableText } from "../lib/moderation";
 import { sendConfirmationCode, sendPasswordRecovery } from "../lib/authEmail";
 
 const router = Router();
@@ -94,6 +95,7 @@ router.post("/register", async (req, res) => {
     res.status(400).json({ error: "Username must be 3-24 characters: lowercase letters, numbers, underscores" });
     return;
   }
+  if (rejectObjectionableText(res, [username])) return;
 
   const { data: taken, error: lookupError } = await adminDb
     .from("profiles")

@@ -85,10 +85,19 @@ completeness" rejection):
 
 ## App privacy questionnaire ▢
 
-- **Data collected:** email + username (account), session/focus history.
-  The **mobile apps contain no analytics SDK** (PostHog runs only on the web
-  app), so the iOS privacy label / Play data safety form should NOT declare
-  in-app analytics. Nothing is used for third-party advertising or tracking.
+- **Data collected for app functionality:** email address, internal user ID,
+  username/profile content, friend and conversation data, messages, safety
+  reports, blocks, session/focus history, tasks, and push notification tokens.
+- **Data collected for analytics:** the production mobile app uses PostHog for
+  manually instrumented product-interaction events. After login, events are
+  linked to the internal BetterPomo user ID. PostHog also receives a
+  pseudonymous installation identifier plus basic app/device metadata. Declare
+  **Identifiers → User ID / Device ID** and **Usage Data → Product Interaction**
+  for the **Analytics** purpose and mark them as linked to identity. Automatic
+  error capture and session replay are disabled, so do not declare crash data
+  or screen recordings for the current implementation.
+- **Tracking:** no. BetterPomo does not use IDFA, ATT, advertising, data-broker
+  sharing, or data to track users across other companies' apps or websites.
 - **Account deletion URL / method:** point to the in-app flow (Settings → Delete
   account). Apple accepts the in-app path. Google Play's Data safety form
   additionally requires a **web link** for deletion requests — use
@@ -98,6 +107,46 @@ completeness" rejection):
   site). Terms: `https://betterpomo.com/terms`.
 - **Tracking:** the app does not use ATT/IDFA. Do not add an
   `NSUserTrackingUsageDescription` unless you add tracking.
+
+Use these App Store Connect answers for the current production build:
+
+| Apple data type | Purpose | Linked to user | Tracking |
+| --- | --- | --- | --- |
+| Contact Info → Name | App Functionality | Yes | No |
+| Contact Info → Email Address | App Functionality; Developer Communications | Yes | No |
+| User Content → Emails or Text Messages | App Functionality | Yes | No |
+| User Content → Other User Content | App Functionality | Yes | No |
+| Identifiers → User ID | App Functionality; Analytics | Yes | No |
+| Identifiers → Device ID | App Functionality; Analytics | Yes | No |
+| Usage Data → Product Interaction | Analytics | Yes | No |
+
+`Other User Content` covers profile text, session/timer/task names, safety report
+details, and report snapshots. `Device ID` covers the app-bounded PostHog
+installation identifier and push token. Do not select location, contacts,
+photos/videos, audio data, purchases, browsing/search history, sensitive info,
+financial/health data, crash data, performance data, or advertising data: the
+current app does not transmit those categories for collection. User-selected
+custom audio stays on device; recap images are created locally and only added
+to Photos when the user explicitly asks.
+
+## User-generated content safety (done in code) ✅
+
+- ✅ Incoming direct/group and live-session messages have a visible Report
+  control. Profiles have Report User and Block/Unblock controls, and direct
+  chats expose the same account actions from the header safety menu.
+- ✅ Blocking ends friendship/request state and prevents future messages,
+  invitations, notifications, profile activity, and session joins in both
+  directions. Settings → Safety & support lists blocked accounts for unblocking.
+- ✅ Reports are stored in `content_reports` with an authoritative snapshot of
+  the reported user/message and moderation status. Moderator notification email
+  is best-effort; the documented review target is within **24 hours**.
+- ✅ Server-side filtering rejects unequivocal slurs, explicit sexual content,
+  threats, self-harm encouragement, and obvious spam before user-visible text is
+  stored. Context-dependent abuse remains reportable.
+- ✅ Settings includes Contact Support & Safety and links to
+  `https://betterpomo.com/safety`.
+- ✅ `NSCameraUsageDescription` was removed. Custom sounds use the system Files
+  picker and do not request camera access.
 
 ## Permissions sanity ▢
 

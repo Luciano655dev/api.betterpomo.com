@@ -5,6 +5,7 @@ import { authenticate } from "../middleware/auth";
 import { cache, TTL } from "../lib/cache";
 import { notify } from "../lib/notify";
 import { clampInt } from "../lib/utils";
+import { usersHaveBlockedEachOther } from "../lib/blocks";
 
 const router = Router();
 router.use(authenticate);
@@ -75,6 +76,9 @@ router.post("/requests", async (req, res) => {
   const targetId = await resolveUserId(supabase, body.username.trim());
   if (!targetId) { res.status(404).json({ error: "User not found" }); return; }
   if (targetId === user.id) { res.status(400).json({ error: "Cannot send a friend request to yourself" }); return; }
+  if (await usersHaveBlockedEachOther(supabase, user.id, targetId)) {
+    res.status(403).json({ error: "Interaction unavailable" }); return;
+  }
 
   const { data, error } = await supabase.rpc("send_friend_request", {
     p_actor: user.id,
@@ -100,6 +104,10 @@ router.post("/requests", async (req, res) => {
 router.post("/requests/:userId/accept", async (req, res) => {
   const { user, supabase } = req;
   const requesterId = String(req.params.userId);
+
+  if (await usersHaveBlockedEachOther(supabase, user.id, requesterId)) {
+    res.status(403).json({ error: "Interaction unavailable" }); return;
+  }
 
   const { error } = await supabase.rpc("respond_friend_request", {
     p_actor: user.id,

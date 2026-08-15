@@ -5,6 +5,7 @@ import { cache, TTL } from "../lib/cache";
 import { clampInt } from "../lib/utils";
 import { getUserEntitlements, TIMERS_HARD_CAP, upgradeRequired } from "../lib/plans";
 import { getSessionTimeMetrics } from "../lib/sessionTime";
+import { rejectObjectionableText } from "../lib/moderation";
 
 const router = Router();
 
@@ -198,6 +199,7 @@ router.post("/", authenticate, async (req, res) => {
   if (typeof body.session_name !== "string" || !body.session_name.trim()) {
     res.status(400).json({ error: "session_name is required" }); return;
   }
+  if (rejectObjectionableText(res, [body.session_name])) return;
   if (typeof body.duration_seconds !== "number" || body.duration_seconds < 0) {
     res.status(400).json({ error: "duration_seconds must be a non-negative number" }); return;
   }
@@ -260,6 +262,10 @@ router.post("/", authenticate, async (req, res) => {
         .slice(0, ent.maxTasks)
         .map((t) => ({ text: t.text.trim().slice(0, 200), done: t.done === true }))
     : [];
+  if (rejectObjectionableText(res, [
+    ...timersUsed.map((timer) => timer.name),
+    ...tasks.map((task) => task.text),
+  ])) return;
 
   // Snapshot session privacy at save time (the session may be deleted later).
   // Trust an explicit body flag, else look it up from the session.
@@ -430,6 +436,7 @@ router.patch("/:id", authenticate, async (req, res) => {
     if (sessionName.length > MAX_SESSION_NAME_LENGTH) {
       res.status(400).json({ error: `session_name must be ${MAX_SESSION_NAME_LENGTH} characters or less` }); return;
     }
+    if (rejectObjectionableText(res, [sessionName])) return;
     patch.session_name = sessionName;
   }
   if (typeof body.duration_seconds === "number" && body.duration_seconds >= 0) {

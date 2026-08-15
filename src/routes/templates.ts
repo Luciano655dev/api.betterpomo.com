@@ -5,6 +5,7 @@ import { authenticate } from "../middleware/auth";
 import { serverError } from "../lib/http";
 import { cache, TTL } from "../lib/cache";
 import { getUserEntitlements, upgradeRequired, TIMERS_HARD_CAP } from "../lib/plans";
+import { rejectObjectionableText } from "../lib/moderation";
 
 const router = Router();
 router.use(authenticate);
@@ -55,6 +56,7 @@ router.post("/", async (req, res) => {
         .map((t) => ({ name: t.name.trim().slice(0, 80), duration: Math.min(Math.floor(t.duration), 86400) }))
     : [];
   if (!timers.length) { res.status(400).json({ error: "timers must contain at least one timer" }); return; }
+  if (rejectObjectionableText(res, [body.name, ...timers.map((timer) => timer.name)])) return;
 
   const { count } = await supabase
     .from("session_templates")
