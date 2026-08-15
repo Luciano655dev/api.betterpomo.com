@@ -83,8 +83,9 @@ async function notifyModerators(report: {
   reporter_id: string;
   reported_user_id: string;
 }) {
-  const recipient = process.env.CONTACT_NOTIFY_EMAIL ?? process.env.WISHLIST_NOTIFY_EMAIL;
-  if (!recipient) return;
+  const recipient = process.env.CONTACT_NOTIFY_EMAIL
+    ?? process.env.WISHLIST_NOTIFY_EMAIL
+    ?? "lucianomenezes655@gmail.com";
   await sendEmail({
     to: recipient,
     subject: `[BetterPomo safety] New ${report.subject_type.replace("_", " ")} report`,
