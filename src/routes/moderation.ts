@@ -2,7 +2,7 @@ import { Router } from "express";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getMutuallyBlockedUserIds } from "../lib/blocks";
 import { cache } from "../lib/cache";
-import { renderBrandedEmail, sendEmail } from "../lib/email";
+import { renderBrandedEmail, sendEmailDetailed } from "../lib/email";
 import { serverError } from "../lib/http";
 import { authenticate } from "../middleware/auth";
 import { perUserLimiter } from "../middleware/rateLimit";
@@ -41,7 +41,7 @@ function resolveUserId(supabase: SupabaseClient, username: string) {
 }
 
 function moderationSchemaUnavailable(error: { code?: string } | null | undefined): boolean {
-  return error?.code === "42P01" || error?.code === "PGRST205";
+  return ["42P01", "42883", "PGRST202", "PGRST205"].includes(error?.code ?? "");
 }
 
 function handleModerationError(res: Parameters<typeof serverError>[0], error: { code?: string; message?: string }) {
@@ -82,33 +82,45 @@ async function notifyModerators(report: {
   reason: ReportReason;
   reporter_id: string;
   reported_user_id: string;
+  details: string | null;
+  reporter: { username: string; display_name: string; email?: string };
+  reported: { username: string; display_name: string };
 }) {
-  const recipient = process.env.CONTACT_NOTIFY_EMAIL
-    ?? process.env.WISHLIST_NOTIFY_EMAIL
-    ?? "lucianomenezes655@gmail.com";
-  await sendEmail({
+  const recipient = process.env.SAFETY_NOTIFY_EMAIL?.trim() || "lucianomenezes655@gmail.com";
+  const reporterLabel = `${report.reporter.display_name} (@${report.reporter.username})`;
+  const reportedLabel = `${report.reported.display_name} (@${report.reported.username})`;
+  return sendEmailDetailed({
     to: recipient,
-    subject: `[BetterPomo safety] New ${report.subject_type.replace("_", " ")} report`,
+    subject: `[BetterPomo safety] Report about @${report.reported.username}`,
+    idempotencyKey: `safety-report-${report.id}`,
+    tags: [
+      { name: "category", value: "safety-report" },
+      { name: "subject", value: report.subject_type },
+    ],
     text: [
       `Report: ${report.id}`,
+      `Type: ${report.subject_type.replace("_", " ")}`,
       `Reason: ${report.reason}`,
-      `Reporter: ${report.reporter_id}`,
-      `Reported user: ${report.reported_user_id}`,
+      `Reporter: ${reporterLabel} (${report.reporter_id})`,
+      report.reporter.email ? `Reporter email: ${report.reporter.email}` : null,
+      `Reported user: ${reportedLabel} (${report.reported_user_id})`,
+      report.details ? `Details: ${report.details}` : "Details: none provided",
       `Response target: within ${MODERATION_RESPONSE_HOURS} hours`,
       "",
       "Review the content_reports table or the authenticated moderation API.",
-    ].join("\n"),
+    ].filter(Boolean).join("\n"),
     html: renderBrandedEmail({
-      preview: "A new BetterPomo safety report needs review.",
+      preview: `A new BetterPomo safety report about @${report.reported.username} needs review.`,
       eyebrow: "Trust & Safety",
-      heading: "New user report",
+      heading: `New report about @${report.reported.username}`,
       paragraphs: [`Please review this report within ${MODERATION_RESPONSE_HOURS} hours.`],
       details: [
         { label: "Report ID", value: report.id },
         { label: "Type", value: report.subject_type.replace("_", " ") },
         { label: "Reason", value: report.reason.replaceAll("_", " ") },
-        { label: "Reporter", value: report.reporter_id },
-        { label: "Reported user", value: report.reported_user_id },
+        { label: "Reporter", value: `${reporterLabel}\n${report.reporter.email ?? "No email available"}\n${report.reporter_id}` },
+        { label: "Reported user", value: `${reportedLabel}\n${report.reported_user_id}` },
+        { label: "Details", value: report.details || "None provided" },
       ],
     }),
   });
@@ -197,22 +209,11 @@ router.post("/blocks", async (req, res) => {
   if (!target) { res.status(404).json({ error: "User not found" }); return; }
   if (target.id === user.id) { res.status(400).json({ error: "You cannot block yourself" }); return; }
 
-  const { error } = await supabase.from("user_blocks").upsert({
-    blocker_id: user.id,
-    blocked_id: target.id,
-  }, { onConflict: "blocker_id,blocked_id" });
+  const { error } = await supabase.rpc("block_user_and_cleanup", {
+    p_actor: user.id,
+    p_target: target.id,
+  });
   if (error) { handleModerationError(res, error); return; }
-
-  // Blocking ends friendship/request state and removes pending social alerts.
-  await Promise.all([
-    supabase.from("friendships").delete()
-      .eq("user_a", [user.id, target.id].sort()[0])
-      .eq("user_b", [user.id, target.id].sort()[1]),
-    supabase.from("notifications").delete().eq("user_id", user.id).eq("actor_id", target.id),
-    supabase.from("notifications").delete().eq("user_id", target.id).eq("actor_id", user.id),
-    supabase.from("group_invitations").delete().eq("invited_user", user.id).eq("invited_by", target.id).eq("status", "pending"),
-    supabase.from("group_invitations").delete().eq("invited_user", target.id).eq("invited_by", user.id).eq("status", "pending"),
-  ]);
   invalidateSocialState(user.id, target.id);
   res.status(201).json({ data: { target_id: target.id, username: target.username, blocked: true } });
 });
@@ -321,17 +322,44 @@ router.post("/reports", reportLimiter, async (req, res) => {
     .single();
   if (error) { handleModerationError(res, error); return; }
 
-  void notifyModerators({
+  const { data: identities, error: identitiesError } = await supabase
+    .from("profiles")
+    .select("id, username, display_name")
+    .in("id", [user.id, reportedUserId]);
+  if (identitiesError) console.error("moderation identity snapshot failed", identitiesError);
+  const reporterProfile = identities?.find((profile) => profile.id === user.id);
+  const reportedProfile = identities?.find((profile) => profile.id === reportedUserId);
+  const delivery = await notifyModerators({
     id: report.id,
     subject_type: subjectType,
     reason,
     reporter_id: user.id,
     reported_user_id: reportedUserId,
-  }).catch((notificationError) => console.error("moderation email failed", notificationError));
+    details,
+    reporter: {
+      username: reporterProfile?.username ?? "unknown",
+      display_name: reporterProfile?.display_name ?? reporterProfile?.username ?? "Unknown user",
+      email: user.email,
+    },
+    reported: {
+      username: reportedProfile?.username ?? "unknown",
+      display_name: reportedProfile?.display_name ?? reportedProfile?.username ?? "Unknown user",
+    },
+  });
+  const deliveryPatch = delivery.ok
+    ? { notification_sent_at: new Date().toISOString(), notification_error: null }
+    : { notification_sent_at: null, notification_error: delivery.error.slice(0, 1000) };
+  const { error: deliveryAuditError } = await supabase
+    .from("content_reports")
+    .update(deliveryPatch)
+    .eq("id", report.id);
+  if (deliveryAuditError) console.error("moderation email audit failed", deliveryAuditError);
+  if (!delivery.ok) console.error("moderation email failed", delivery.error);
   res.status(201).json({
     data: {
       ...report,
       response_hours: MODERATION_RESPONSE_HOURS,
+      notification_sent: delivery.ok,
     },
   });
 });
