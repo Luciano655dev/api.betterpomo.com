@@ -92,8 +92,10 @@ async function notifyModerators(report: {
   return sendEmailDetailed({
     to: recipient,
     // Safety delivery must not inherit a personal Gmail address from the
-    // general email override; Resend only accepts verified sending domains.
-    from: "BetterPomo Safety <no-reply@auth.betterpomo.com>",
+    // general email override. Until the BetterPomo domain is DNS-verified,
+    // Resend's authenticated test sender can deliver to the account owner.
+    from: process.env.SAFETY_FROM_EMAIL?.trim()
+      || "BetterPomo Safety <onboarding@resend.dev>",
     subject: `[BetterPomo safety] Report about @${report.reported.username}`,
     idempotencyKey: `safety-report-${report.id}`,
     tags: [
