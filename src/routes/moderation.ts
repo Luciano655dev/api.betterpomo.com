@@ -91,6 +91,9 @@ async function notifyModerators(report: {
   const reportedLabel = `${report.reported.display_name} (@${report.reported.username})`;
   return sendEmailDetailed({
     to: recipient,
+    // Safety delivery must not inherit a personal Gmail address from the
+    // general email override; Resend only accepts verified sending domains.
+    from: "BetterPomo Safety <no-reply@auth.betterpomo.com>",
     subject: `[BetterPomo safety] Report about @${report.reported.username}`,
     idempotencyKey: `safety-report-${report.id}`,
     tags: [
