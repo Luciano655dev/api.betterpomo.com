@@ -63,6 +63,8 @@ WEB_URL=http://localhost:3000
 RESEND_API_KEY=your-resend-key
 RESEND_FROM_EMAIL=no-reply@auth.betterpomo.com
 AUTH_FROM_EMAIL=no-reply@auth.betterpomo.com
+SAFETY_NOTIFY_EMAIL=you@example.com
+SAFETY_FROM_EMAIL="BetterPomo Safety <safety@your-verified-domain.com>"
 # Optional for Supabase-triggered Auth emails outside API registration/recovery:
 SEND_EMAIL_HOOK_SECRET=v1,whsec_your-supabase-hook-secret
 # Optional: REDIS_URL, STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, BILLING_ENABLED=false
