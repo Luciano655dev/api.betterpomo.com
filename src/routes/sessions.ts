@@ -315,7 +315,7 @@ router.get("/mine/active", authenticate, async (req, res) => {
   const { user, supabase } = req;
   const { data, error } = await supabase
     .from("session_participants")
-    .select(`joined_at, last_seen_at, pomodoro_sessions!inner(id, name, code, status, session_type, timer_state, timer_started_at, paused_elapsed_seconds, current_timer_index)`)
+    .select(`role, joined_at, last_seen_at, pomodoro_sessions!inner(id, name, code, status, session_type, timer_state, timer_started_at, paused_elapsed_seconds, current_timer_index)`)
     .eq("user_id", user.id)
     .is("left_at", null)
     .in("pomodoro_sessions.status", ["waiting", "active"])
@@ -323,7 +323,7 @@ router.get("/mine/active", authenticate, async (req, res) => {
     .limit(1);
   if (error) { serverError(res, error); return; }
   // supabase-js types the !inner embed as an array even though it's one row.
-  const row = data?.[0] as unknown as { joined_at: string; last_seen_at?: string | null; pomodoro_sessions: { id: string; current_timer_index: number } } | undefined;
+  const row = data?.[0] as unknown as { role: "owner" | "admin" | "member"; joined_at: string; last_seen_at?: string | null; pomodoro_sessions: { id: string; current_timer_index: number } } | undefined;
   if (!row) { res.json({ data: null }); return; }
 
   // This poll fires whenever the app is open (drives the background-session
@@ -339,7 +339,7 @@ router.get("/mine/active", authenticate, async (req, res) => {
     .order("order");
   const currentTimer = timers?.[row.pomodoro_sessions.current_timer_index] ?? null;
 
-  res.json({ data: { joined_at: row.joined_at, session: row.pomodoro_sessions, current_timer: currentTimer } });
+  res.json({ data: { role: row.role, joined_at: row.joined_at, session: row.pomodoro_sessions, current_timer: currentTimer } });
 });
 
 /** POST /api/sessions
